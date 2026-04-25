@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Set up a recurring watcher via the Discord bot socket.
+Usage:
+  claude-watch --command "gh pr view ..." --match "MERGED" --notify "PR merged!" [--every 60] [--timeout 60] [--description "..."]
+  claude-watch --extend <id> --timeout <minutes>
+  claude-watch --list
+  claude-watch --cancel <id>
+"""
+import argparse
+import json
+import socket
+import sys
+
+SOCKET = "/run/claude-discord.sock"
+
+def send(payload: dict) -> str:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(SOCKET)
+    s.sendall(json.dumps(payload).encode("utf-8"))
+    s.shutdown(socket.SHUT_WR)
+    resp = s.recv(4096).decode("utf-8", errors="replace").strip()
+    s.close()
+    return resp
+
+p = argparse.ArgumentParser(description="Set up a recurring watcher")
+p.add_argument("--command", help="Shell command to run periodically")
+p.add_argument("--match", help="String to match in command output (case-insensitive)")
+p.add_argument("--notify", default="Watcher condition met.", help="Message to send when matched")
+p.add_argument("--every", type=int, default=60, help="Check interval in seconds (default: 60, min: 10)")
+p.add_argument("--timeout", type=int, default=60, help="Auto-expire after N minutes (default: 60, max: 1440)")
+p.add_argument("--description", default="", help="Short description for the watcher")
+p.add_argument("--extend", metavar="ID", help="Extend a running watcher by ID prefix")
+p.add_argument("--list", action="store_true", help="List active watchers")
+p.add_argument("--cancel", metavar="ID", help="Cancel a watcher by ID prefix")
+args = p.parse_args()
+
+try:
+    if args.list:
+        print(send({"type": "list"}))
+    elif args.cancel:
+        print(send({"type": "cancel", "id": args.cancel}))
+    elif args.extend:
+        print(send({"type": "extend", "id": args.extend, "timeout": args.timeout}))
+    elif args.command and args.match:
+        resp = send({
+            "type": "watch",
+            "command": args.command,
+            "match": args.match,
+            "notify": args.notify,
+            "every": args.every,
+            "timeout": args.timeout,
+            "description": args.description or args.command[:60],
+        })
+        if resp.startswith("ok:"):
+            wid = resp.split(":", 1)[1]
+            print(f"Watcher started: {wid[:8]} (checking every {args.every}s, timeout {args.timeout}min)")
+        else:
+            print(resp, file=sys.stderr)
+            sys.exit(1)
+    else:
+        p.print_help()
+        sys.exit(1)
+except FileNotFoundError:
+    print(f"claude-watch: socket {SOCKET} not found (bot not running?)", file=sys.stderr)
+    sys.exit(1)

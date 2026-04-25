@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Send a notification via the Discord bridge socket.
+Usage: claude-notify "message"
+   or: echo "message" | claude-notify
+"""
+import socket, sys
+SOCKET = "/run/claude-discord.sock"
+msg = " ".join(sys.argv[1:]).strip() if len(sys.argv) > 1 else sys.stdin.read().strip()
+if not msg:
+    sys.exit(0)
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(SOCKET)
+    s.sendall(msg.encode("utf-8"))
+    s.shutdown(socket.SHUT_WR)
+    s.recv(16)  # consume ack
+    s.close()
+except FileNotFoundError:
+    print(f"claude-notify: socket {SOCKET} not found", file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f"claude-notify: {e}", file=sys.stderr)
+    sys.exit(1)

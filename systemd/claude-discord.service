@@ -1,0 +1,23 @@
+[Unit]
+Description=Claude Code Discord bridge
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/claude-discord/venv/bin/python /opt/claude-discord/bot.py
+Restart=on-failure
+RestartSec=5
+# Runs as root because claude-sandbox uses docker (docker group == root)
+User=root
+StandardOutput=journal
+StandardError=journal
+# Basic hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/var/lib/claude-discord /home/claude/.claude-container /run
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

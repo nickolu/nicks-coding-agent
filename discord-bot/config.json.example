@@ -1,0 +1,4 @@
+{
+  "bot_token": "REPLACE_WITH_DISCORD_BOT_TOKEN",
+  "allowed_user_id": "REPLACE_WITH_YOUR_DISCORD_USER_ID"
+}

@@ -1,0 +1,23 @@
+# Real secrets — only commit the .example versions
+discord-bot/config.json
+claude-config/.env
+claude-config/.credentials.json
+
+# Runtime / state directories on the host (never copied here, but listed for clarity)
+**/sessions/
+**/cache/
+**/file-history/
+**/shell-snapshots/
+**/telemetry/
+**/projects/
+**/plans/
+**/backups/
+**/__pycache__/
+**/venv/
+*.log
+*.pyc
+
+# Local editor / OS noise
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,34 @@
+#!/bin/bash
+set -e
+CLAUDE_HOST=/home/claude/.claude-container
+PROJECTS=/home/claude/projects
+
+if [ ! -f "$CLAUDE_HOST/claude.json" ]; then
+  touch "$CLAUDE_HOST/claude.json"
+  chown claude:claude "$CLAUDE_HOST/claude.json"
+  chmod 600 "$CLAUDE_HOST/claude.json"
+fi
+
+TTY_FLAGS=()
+if [ -t 0 ] && [ -t 1 ]; then TTY_FLAGS=(-it); fi
+
+DOCKER_ARGS=(
+  --rm "${TTY_FLAGS[@]}"
+  --name "claude-sandbox-$$"
+  --hostname claude-sandbox
+  -v "$CLAUDE_HOST:/home/claude/.claude"
+  -v "$CLAUDE_HOST/claude.json:/home/claude/.claude.json"
+  -v "/run/claude-discord.sock:/run/claude-discord.sock"
+  -v "$CLAUDE_HOST/claude-notify:/usr/local/bin/claude-notify:ro"
+  -v "$CLAUDE_HOST/claude-watch:/usr/local/bin/claude-watch:ro"
+  -v "$PROJECTS:/workspace"
+  --env-file "$CLAUDE_HOST/.env"
+  -w /workspace
+  claude-sandbox:latest
+)
+
+case "$1" in
+  shell) exec docker run "${DOCKER_ARGS[@]}" bash ;;
+  -p)    shift; exec docker run "${DOCKER_ARGS[@]}" claude --dangerously-skip-permissions -p "$@" ;;
+  *)     exec docker run "${DOCKER_ARGS[@]}" claude --dangerously-skip-permissions "$@" ;;
+esac
