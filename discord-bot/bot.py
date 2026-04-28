@@ -278,11 +278,32 @@ Rules:
 - Do not merge PRs without CI passing.
 - Use subagents for scouting and execution (advisor pattern).
 - End your response with a brief summary of what you did this cycle.
+
+After the summary, the VERY LAST LINE of your response must be exactly one of:
+- `STATUS: ACTIVE` — you merged a PR, fixed/pushed commits to a PR, opened a new PR, or otherwise produced commits/PRs/merges this cycle. The loop will immediately start the next cycle.
+- `STATUS: IDLE` — you only inspected state, found nothing actionable, or only brainstormed without opening any PR or issue. The loop will sleep the interval before the next cycle.
+
+If unsure, emit `STATUS: IDLE` (safer default — better to wait than to spin).
 """
 
 
+STATUS_RE = re.compile(r"^\s*STATUS:\s*(ACTIVE|IDLE)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def parse_cycle_status(reply: str) -> str:
+    """Return 'ACTIVE' or 'IDLE'. Defaults to IDLE if no marker found."""
+    matches = STATUS_RE.findall(reply)
+    if not matches:
+        return "IDLE"
+    return matches[-1].upper()
+
+
 async def auto_loop(project: str, repo: str, duration_min: int, interval_min: int, instructions: str):
-    """Run the autonomous development loop."""
+    """Run the autonomous development loop.
+
+    Cycles chain back-to-back when Claude reports STATUS: ACTIVE, and fall back to
+    sleeping `interval_min` between cycles on STATUS: IDLE, missing marker, or error.
+    """
     session_id = str(uuid.uuid4())
     deadline = time.time() + duration_min * 60
     cycle = 0
@@ -290,7 +311,7 @@ async def auto_loop(project: str, repo: str, duration_min: int, interval_min: in
     log.info(f"auto-loop started: project={project} repo={repo} duration={duration_min}m interval={interval_min}m")
     await send_dm(
         f"\U0001f916 **Auto mode started** for `{project}`\n"
-        f"Duration: {duration_min}min | Interval: {interval_min}min\n"
+        f"Duration: {duration_min}min | Idle interval: {interval_min}min\n"
         f"Instructions: {instructions or '(none)'}\n"
         f"Session: `{session_id[:8]}`\n"
         f"Use `!auto stop` to end early."
@@ -302,22 +323,37 @@ async def auto_loop(project: str, repo: str, duration_min: int, interval_min: in
             remaining = int((deadline - time.time()) / 60)
             log.info(f"auto-loop {project} cycle {cycle} ({remaining}min remaining)")
 
-            # Gather current state
-            state = await gather_project_state(project, repo)
+            status = "IDLE"
+            reply = ""
+            try:
+                state = await gather_project_state(project, repo)
+                prompt = build_auto_prompt(project, repo, instructions, state, cycle)
+                first_call = (cycle == 1)
+                reply = await run_claude(session_id, first_call, prompt)
+                status = parse_cycle_status(reply)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.exception(f"auto-loop {project} cycle {cycle} failed")
+                await send_dm(
+                    f"⚠️ **Auto cycle #{cycle} errored** — `{project}`: {e}\n"
+                    f"Backing off {interval_min}min."
+                )
 
-            # Build prompt and run Claude
-            prompt = build_auto_prompt(project, repo, instructions, state, cycle)
-            first_call = (cycle == 1)
+            if reply:
+                summary = reply[-1500:] if len(reply) > 1500 else reply
+                mode_label = "chaining next cycle" if status == "ACTIVE" else f"idle — sleeping {interval_min}min"
+                await send_dm(
+                    f"\U0001f504 **Auto cycle #{cycle}** — `{project}` "
+                    f"({remaining}min left, {mode_label})\n{summary}"
+                )
 
-            reply = await run_claude(session_id, first_call, prompt)
+            log.info(f"auto-loop {project} cycle {cycle} status={status}")
 
-            # Post cycle summary to Discord
-            summary = reply[-1500:] if len(reply) > 1500 else reply
-            await send_dm(
-                f"\U0001f504 **Auto cycle #{cycle}** — `{project}` ({remaining}min left)\n{summary}"
-            )
+            if status == "ACTIVE":
+                await asyncio.sleep(0)  # yield to the event loop, then chain
+                continue
 
-            # Sleep until next cycle
             sleep_time = min(interval_min * 60, deadline - time.time())
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
