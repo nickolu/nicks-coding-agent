@@ -32,7 +32,38 @@ These live only on the host because they are secrets or runtime state:
 - `/home/claude/.claude-container/{claude.json,history.jsonl,tripwire.log}` — runtime state and logs
 - `/var/lib/claude-discord/sessions.json` — bot session state
 
-## Updating from the droplet
+## Deploy workflow
+
+The droplet has a clone of this repo at `/opt/claude-bridge`. To ship a change:
+
+```sh
+# on the laptop
+git add … && git commit -m "…" && git push
+
+# on the droplet
+ssh droplet
+cd /opt/claude-bridge
+sudo git pull
+sudo ./sync.sh -n      # dry-run: shows what would change and what restarts
+sudo ./sync.sh         # apply
+```
+
+`sync.sh` copies each repo file to its host path with the correct
+owner/perms, then conditionally:
+
+- restarts `claude-discord` if `bot.py` or the systemd unit changed
+- runs `systemctl daemon-reload` if the systemd unit changed
+- prints a reminder to rebuild the Docker image if `Dockerfile` changed
+  (the rebuild is left manual because it's slow)
+
+Re-running with no upstream changes is a no-op.
+
+## Pulling ad-hoc changes back from the droplet
+
+If you edit a file directly on the droplet and want to bring it into the repo
+to commit, use `scp` (or just `git add` it on the droplet and push from
+`/opt/claude-bridge` — but only after running `sync.sh` once so the repo and
+host paths actually agree).
 
 ```sh
 scp droplet:/opt/claude-discord/bot.py discord-bot/bot.py
