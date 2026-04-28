@@ -208,6 +208,13 @@ def start_watcher(payload: dict) -> str:
     }
     task = asyncio.create_task(watcher_loop(watcher_id, info))
     WATCHERS[watcher_id] = {"task": task, "info": info}
+
+    asyncio.create_task(send_dm(
+        f"\U0001f440 **Watcher started** (`{watcher_id[:8]}`)\n"
+        f"{description}\n"
+        f"Checking every {every}s, expires in {timeout_min}min."
+    ))
+
     return f"ok:{watcher_id}"
 
 
@@ -328,6 +335,10 @@ async def auto_loop(project: str, repo: str, duration_min: int, interval_min: in
             cycle += 1
             remaining = int((deadline - time.time()) / 60)
             log.info(f"auto-loop {project} cycle {cycle} ({remaining}min remaining)")
+
+            await send_dm(
+                f"\U0001f680 **Auto cycle #{cycle} starting** — `{project}` ({remaining}min left)"
+            )
 
             status = "IDLE"
             reply = ""
