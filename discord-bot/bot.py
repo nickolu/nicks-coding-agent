@@ -119,9 +119,15 @@ def split_discord(text: str, limit: int = 1900) -> list[str]:
 # --- Watcher system ---
 
 async def run_check_command(command: str) -> str:
-    """Run a check command inside an ephemeral sandbox container."""
+    """Run a check command inside an ephemeral sandbox container.
+
+    Mounts /home/claude/projects -> /workspace so commands can `cd /workspace/<project>`
+    the same way Claude does inside its main sandbox container.
+    """
     args = [
         "docker", "run", "--rm",
+        "-v", "/home/claude/projects:/workspace",
+        "-w", "/workspace",
         "--env-file", "/home/claude/.claude-container/.env",
         "claude-sandbox:latest",
         "bash", "-c", command,
