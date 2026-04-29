@@ -295,59 +295,78 @@ Rules:
 After the summary, the VERY LAST LINE of your response must be exactly one of:
 - `STATUS: ACTIVE` — you merged a PR, fixed/pushed commits to a PR, opened a new PR, or otherwise produced commits/PRs/merges this cycle. The loop will immediately start the next cycle.
 - `STATUS: IDLE` — you only inspected state, found nothing actionable, or only brainstormed without opening any PR or issue. The loop will sleep the interval before the next cycle.
+- `STATUS: STOP` — you have completed the user's stated objective and there is no more work that fits the instructions. Use this only when the instructions were bounded (e.g., "finish issue #529 then stop", "work on tap tap then stop"). Do NOT use STOP for transient blocks or unfinished work — use IDLE for those. Put a one-line `Reason: <why>` immediately above the STATUS line.
 
-If unsure, emit `STATUS: IDLE` (safer default — better to wait than to spin).
+If unsure, emit `STATUS: IDLE` (safer default — better to wait than to spin or stop early).
 """
 
 
-STATUS_RE = re.compile(r"^\s*STATUS:\s*(ACTIVE|IDLE)\s*$", re.IGNORECASE | re.MULTILINE)
+STATUS_RE = re.compile(r"^\s*STATUS:\s*(ACTIVE|IDLE|STOP)\s*$", re.IGNORECASE | re.MULTILINE)
+STOP_REASON_RE = re.compile(r"^\s*Reason:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 
 
-def parse_cycle_status(reply: str) -> str:
-    """Return 'ACTIVE' or 'IDLE'. Defaults to IDLE if no marker found."""
+def parse_cycle_status(reply: str) -> tuple[str, str]:
+    """Return (status, reason). Status is 'ACTIVE'|'IDLE'|'STOP'.
+
+    Defaults to ('IDLE', '') if no marker is found. `reason` is only set for STOP.
+    """
     matches = STATUS_RE.findall(reply)
-    if not matches:
-        return "IDLE"
-    return matches[-1].upper()
+    status = matches[-1].upper() if matches else "IDLE"
+    reason = ""
+    if status == "STOP":
+        r = STOP_REASON_RE.findall(reply)
+        if r:
+            reason = r[-1].strip()
+    return status, reason
 
 
-async def auto_loop(project: str, repo: str, duration_min: int, interval_min: int, instructions: str):
+async def auto_loop(project: str, info: dict):
     """Run the autonomous development loop.
 
-    Cycles chain back-to-back when Claude reports STATUS: ACTIVE, and fall back to
-    sleeping `interval_min` between cycles on STATUS: IDLE, missing marker, or error.
+    Reads `instructions` and `cycle` live from `info` so they can be mutated
+    mid-run (e.g. via `!auto update`). Cycles chain back-to-back on STATUS: ACTIVE,
+    sleep `interval_min` on STATUS: IDLE / missing marker / error, and exit cleanly
+    on STATUS: STOP.
     """
     session_id = str(uuid.uuid4())
-    deadline = time.time() + duration_min * 60
-    cycle = 0
+    repo = info["repo"]
+    deadline = info["deadline"]
+    duration_min = info["duration_min"]
+    interval_min = info["interval_min"]
+    last_announced_instructions = info["instructions"]
 
     log.info(f"auto-loop started: project={project} repo={repo} duration={duration_min}m interval={interval_min}m")
     await send_dm(
         f"\U0001f916 **Auto mode started** for `{project}`\n"
         f"Duration: {duration_min}min | Idle interval: {interval_min}min\n"
-        f"Instructions: {instructions or '(none)'}\n"
+        f"Instructions: {info['instructions'] or '(none)'}\n"
         f"Session: `{session_id[:8]}`\n"
-        f"Use `!auto stop` to end early."
+        f"Use `!auto stop` to end early, or `!auto update <new instructions>` to steer."
     )
 
     try:
         while time.time() < deadline:
-            cycle += 1
+            info["cycle"] += 1
+            cycle = info["cycle"]
+            instructions = info["instructions"]
             remaining = int((deadline - time.time()) / 60)
             log.info(f"auto-loop {project} cycle {cycle} ({remaining}min remaining)")
 
-            await send_dm(
-                f"\U0001f680 **Auto cycle #{cycle} starting** — `{project}` ({remaining}min left)"
-            )
+            cycle_dm = f"\U0001f680 **Auto cycle #{cycle} starting** — `{project}` ({remaining}min left)"
+            if instructions != last_announced_instructions:
+                cycle_dm += f"\n\U0001f4dd New instructions in effect: {instructions or '(none)'}"
+                last_announced_instructions = instructions
+            await send_dm(cycle_dm)
 
             status = "IDLE"
+            stop_reason = ""
             reply = ""
             try:
                 state = await gather_project_state(project, repo)
                 prompt = build_auto_prompt(project, repo, instructions, state, cycle)
                 first_call = (cycle == 1)
                 reply = await run_claude(session_id, first_call, prompt)
-                status = parse_cycle_status(reply)
+                status, stop_reason = parse_cycle_status(reply)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -359,13 +378,26 @@ async def auto_loop(project: str, repo: str, duration_min: int, interval_min: in
 
             if reply:
                 summary = reply[-1500:] if len(reply) > 1500 else reply
-                mode_label = "chaining next cycle" if status == "ACTIVE" else f"idle — sleeping {interval_min}min"
+                if status == "ACTIVE":
+                    mode_label = "chaining next cycle"
+                elif status == "STOP":
+                    mode_label = "self-stopping"
+                else:
+                    mode_label = f"idle — sleeping {interval_min}min"
                 await send_dm(
                     f"\U0001f504 **Auto cycle #{cycle}** — `{project}` "
                     f"({remaining}min left, {mode_label})\n{summary}"
                 )
 
             log.info(f"auto-loop {project} cycle {cycle} status={status}")
+
+            if status == "STOP":
+                tail = f" — {stop_reason}" if stop_reason else "."
+                await send_dm(
+                    f"\U0001f6d1 **Auto mode self-stopped** for `{project}` after {cycle} cycles{tail}"
+                )
+                log.info(f"auto-loop {project} self-stopped after {cycle} cycles: {stop_reason}")
+                return
 
             if status == "ACTIVE":
                 await asyncio.sleep(0)  # yield to the event loop, then chain
@@ -375,12 +407,12 @@ async def auto_loop(project: str, repo: str, duration_min: int, interval_min: in
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
 
-        await send_dm(f"\U0001f3c1 **Auto mode finished** for `{project}` after {cycle} cycles.")
-        log.info(f"auto-loop {project} finished after {cycle} cycles")
+        await send_dm(f"\U0001f3c1 **Auto mode finished** for `{project}` after {info['cycle']} cycles.")
+        log.info(f"auto-loop {project} finished after {info['cycle']} cycles")
 
     except asyncio.CancelledError:
-        await send_dm(f"\u26d4 **Auto mode stopped** for `{project}` after {cycle} cycles.")
-        log.info(f"auto-loop {project} cancelled after {cycle} cycles")
+        await send_dm(f"\u26d4 **Auto mode stopped** for `{project}` after {info['cycle']} cycles.")
+        log.info(f"auto-loop {project} cancelled after {info['cycle']} cycles")
     finally:
         AUTO_LOOPS.pop(project, None)
 
@@ -617,6 +649,42 @@ async def on_message(message: discord.Message):
                 await message.channel.send("\n".join(lines))
             return
 
+        # !auto update [project] <new instructions>
+        if len(parts) >= 2 and parts[1] == "update":
+            if not AUTO_LOOPS:
+                await message.channel.send("No auto loops running.")
+                return
+            if len(parts) < 3:
+                await message.channel.send(
+                    "Usage: `!auto update [project] <new instructions>`"
+                )
+                return
+            if parts[2] in AUTO_LOOPS:
+                proj = parts[2]
+                instr_start = 3
+            elif len(AUTO_LOOPS) == 1:
+                proj = next(iter(AUTO_LOOPS))
+                instr_start = 2
+            else:
+                await message.channel.send(
+                    f"Multiple loops running ({', '.join(AUTO_LOOPS.keys())}). "
+                    f"Specify project: `!auto update <project> <instructions>`"
+                )
+                return
+            if len(parts) <= instr_start:
+                await message.channel.send("Provide new instructions after the project name.")
+                return
+            new_instr = " ".join(parts[instr_start:])
+            entry_info = AUTO_LOOPS[proj]["info"]
+            entry_info["instructions"] = new_instr
+            next_cycle = entry_info["cycle"] + 1
+            await message.channel.send(
+                f"\U0001f4dd **Instructions updated** for `{proj}`. "
+                f"Takes effect on cycle #{next_cycle}.\n"
+                f"New: {new_instr}"
+            )
+            return
+
         # !auto <project> <duration> <interval> [instructions...]
         if len(parts) < 4:
             await message.channel.send(
@@ -624,7 +692,8 @@ async def on_message(message: discord.Message):
                 "Example: `!auto cometcave 4h 30m focus on UX improvements`\n\n"
                 "**Other:**\n"
                 "`!auto status` — show running loops\n"
-                "`!auto stop [project]` — stop a loop (or all)"
+                "`!auto stop [project]` — stop a loop (or all)\n"
+                "`!auto update [project] <instructions>` — change instructions mid-run"
             )
             return
 
@@ -659,7 +728,7 @@ async def on_message(message: discord.Message):
             "deadline": time.time() + duration_min * 60,
             "cycle": 0,
         }
-        task = asyncio.create_task(auto_loop(project, repo, duration_min, interval_min, instructions))
+        task = asyncio.create_task(auto_loop(project, info))
         AUTO_LOOPS[project] = {"task": task, "info": info}
         return
 
@@ -675,6 +744,7 @@ async def on_message(message: discord.Message):
             "`!auto <project> <duration> <interval> [instructions]` — autonomous dev loop\n"
             "`!auto status` — show running auto loops\n"
             "`!auto stop [project]` — stop auto loop\n"
+            "`!auto update [project] <instructions>` — change instructions mid-run\n"
             "`!help` — this message\n"
             "\nAnything else is forwarded to Claude."
         )
