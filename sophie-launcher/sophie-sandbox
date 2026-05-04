@@ -12,9 +12,11 @@ fi
 TTY_FLAGS=()
 if [ -t 0 ] && [ -t 1 ]; then TTY_FLAGS=(-it); fi
 
-# Persist gws OAuth tokens across container runs by bind-mounting the keyring dir.
-mkdir -p "$SOPHIE_HOST/keyrings"
-chown sophie:sophie "$SOPHIE_HOST/keyrings"
+# Persist gws OAuth tokens across container runs.
+# `gws` writes credentials to ~/.config/gws/ (credentials.json or credentials.enc + keyring).
+# Bind-mounting both .config/gws and the keyring dir covers both storage modes.
+mkdir -p "$SOPHIE_HOST/gws-config" "$SOPHIE_HOST/keyrings"
+chown sophie:sophie "$SOPHIE_HOST/gws-config" "$SOPHIE_HOST/keyrings"
 
 DOCKER_ARGS=(
   --rm "${TTY_FLAGS[@]}"
@@ -22,6 +24,7 @@ DOCKER_ARGS=(
   --hostname sophie-sandbox
   -v "$SOPHIE_HOST:/home/sophie/.claude"
   -v "$SOPHIE_HOST/claude.json:/home/sophie/.claude.json"
+  -v "$SOPHIE_HOST/gws-config:/home/sophie/.config/gws"
   -v "$SOPHIE_HOST/keyrings:/home/sophie/.local/share/keyrings"
   -v "/run/sophie-discord.sock:/run/sophie-discord.sock"
   -v "$SOPHIE_HOST/sophie-notify:/usr/local/bin/sophie-notify:ro"
