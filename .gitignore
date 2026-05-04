@@ -2,6 +2,9 @@
 discord-bot/config.json
 claude-config/.env
 claude-config/.credentials.json
+sophie-bot/config.json
+sophie-config/.env
+sophie-config/.credentials.json
 
 # Runtime / state directories on the host (never copied here, but listed for clarity)
 **/sessions/

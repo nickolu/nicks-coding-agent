@@ -47,6 +47,7 @@ install_dir_contents() {
 }
 
 # --- the install table ---
+# === Howl (engineer / coding agent) ===
 # Discord bot (root-owned, runs under systemd)
 install_file discord-bot/bot.py                       /opt/claude-discord/bot.py                          root   root   0755
 
@@ -68,15 +69,36 @@ install_file tools/claude-watch                       /home/claude/.claude-conta
 # systemd unit
 install_file systemd/claude-discord.service           /etc/systemd/system/claude-discord.service          root   root   0644
 
+# === Sophie (chief of staff / personal manager) ===
+# Only installed if the sophie OS user exists. This lets Howl-only droplets stay clean.
+if id sophie >/dev/null 2>&1; then
+  install_file sophie-bot/bot.py                      /opt/sophie-discord/bot.py                          root   root   0755
+  install_file sophie-launcher/sophie-sandbox         /usr/local/bin/sophie-sandbox                       root   root   0755
+  install_file sophie-sandbox/Dockerfile              /home/sophie/sandbox/Dockerfile                     sophie sophie 0644
+  install_file sophie-config/settings.json            /home/sophie/.claude-container/settings.json        sophie sophie 0644
+  install_file sophie-config/tripwire.sh              /home/sophie/.claude-container/tripwire.sh          sophie sophie 0755
+  install_file sophie-config/CLAUDE.md                /home/sophie/notebook/CLAUDE.md                     sophie sophie 0644
+  install_file sophie-tools/sophie-notify             /home/sophie/.claude-container/sophie-notify        sophie sophie 0755
+  install_file sophie-tools/sophie-watch              /home/sophie/.claude-container/sophie-watch         sophie sophie 0755
+  install_file sophie-systemd/sophie-discord.service  /etc/systemd/system/sophie-discord.service          root   root   0644
+else
+  echo "(skipping sophie-* install table: sophie user does not exist)"
+fi
+
 # --- decide what to restart ---
 restart_bot=0
+restart_sophie=0
 reload_systemd=0
 warn_dockerfile=0
+warn_sophie_dockerfile=0
 for path in "${CHANGED[@]:-}"; do
   case "$path" in
     /opt/claude-discord/bot.py)                     restart_bot=1 ;;
     /etc/systemd/system/claude-discord.service)     reload_systemd=1; restart_bot=1 ;;
     /home/claude/sandbox/Dockerfile)                warn_dockerfile=1 ;;
+    /opt/sophie-discord/bot.py)                     restart_sophie=1 ;;
+    /etc/systemd/system/sophie-discord.service)     reload_systemd=1; restart_sophie=1 ;;
+    /home/sophie/sandbox/Dockerfile)                warn_sophie_dockerfile=1 ;;
   esac
 done
 
@@ -92,9 +114,11 @@ echo
 
 if (( DRY_RUN )); then
   echo "(dry-run; no actions taken)"
-  (( reload_systemd )) && echo "would: systemctl daemon-reload"
-  (( restart_bot ))    && echo "would: systemctl restart claude-discord"
-  (( warn_dockerfile ))&& echo "note: Dockerfile changed — rebuild with: docker build -t claude-sandbox:latest /home/claude/sandbox"
+  (( reload_systemd ))        && echo "would: systemctl daemon-reload"
+  (( restart_bot ))           && echo "would: systemctl restart claude-discord"
+  (( restart_sophie ))        && echo "would: systemctl restart sophie-discord"
+  (( warn_dockerfile ))       && echo "note: Howl Dockerfile changed — rebuild with: docker build -t claude-sandbox:latest /home/claude/sandbox"
+  (( warn_sophie_dockerfile ))&& echo "note: Sophie Dockerfile changed — rebuild with: docker build -t sophie-sandbox:latest /home/sophie/sandbox"
   exit 0
 fi
 
@@ -107,8 +131,18 @@ if (( restart_bot )); then
   systemctl restart claude-discord
   systemctl --no-pager status claude-discord | head -15
 fi
+if (( restart_sophie )); then
+  echo "+ systemctl restart sophie-discord"
+  systemctl restart sophie-discord
+  systemctl --no-pager status sophie-discord | head -15
+fi
 if (( warn_dockerfile )); then
   echo
-  echo "Dockerfile changed. Rebuild the sandbox image when ready:"
+  echo "Howl Dockerfile changed. Rebuild the sandbox image when ready:"
   echo "    docker build -t claude-sandbox:latest /home/claude/sandbox"
+fi
+if (( warn_sophie_dockerfile )); then
+  echo
+  echo "Sophie Dockerfile changed. Rebuild the sandbox image when ready:"
+  echo "    docker build -t sophie-sandbox:latest /home/sophie/sandbox"
 fi

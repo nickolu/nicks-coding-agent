@@ -1,0 +1,34 @@
+#!/bin/bash
+set -e
+SOPHIE_HOST=/home/sophie/.claude-container
+NOTEBOOK=/home/sophie/notebook
+
+if [ ! -f "$SOPHIE_HOST/claude.json" ]; then
+  touch "$SOPHIE_HOST/claude.json"
+  chown sophie:sophie "$SOPHIE_HOST/claude.json"
+  chmod 600 "$SOPHIE_HOST/claude.json"
+fi
+
+TTY_FLAGS=()
+if [ -t 0 ] && [ -t 1 ]; then TTY_FLAGS=(-it); fi
+
+DOCKER_ARGS=(
+  --rm "${TTY_FLAGS[@]}"
+  --name "sophie-sandbox-$$"
+  --hostname sophie-sandbox
+  -v "$SOPHIE_HOST:/home/sophie/.claude"
+  -v "$SOPHIE_HOST/claude.json:/home/sophie/.claude.json"
+  -v "/run/sophie-discord.sock:/run/sophie-discord.sock"
+  -v "$SOPHIE_HOST/sophie-notify:/usr/local/bin/sophie-notify:ro"
+  -v "$SOPHIE_HOST/sophie-watch:/usr/local/bin/sophie-watch:ro"
+  -v "$NOTEBOOK:/notebook"
+  --env-file "$SOPHIE_HOST/.env"
+  -w /notebook
+  sophie-sandbox:latest
+)
+
+case "$1" in
+  shell) exec docker run "${DOCKER_ARGS[@]}" bash ;;
+  -p)    shift; exec docker run "${DOCKER_ARGS[@]}" claude --dangerously-skip-permissions -p "$@" ;;
+  *)     exec docker run "${DOCKER_ARGS[@]}" claude --dangerously-skip-permissions "$@" ;;
+esac

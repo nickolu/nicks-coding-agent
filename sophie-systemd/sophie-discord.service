@@ -1,0 +1,23 @@
+[Unit]
+Description=Sophie Discord bridge (personal manager)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/sophie-discord/venv/bin/python /opt/sophie-discord/bot.py
+Restart=on-failure
+RestartSec=5
+# Runs as root because sophie-sandbox uses docker (docker group == root)
+User=root
+StandardOutput=journal
+StandardError=journal
+# Basic hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/var/lib/sophie-discord /home/sophie/.claude-container /run
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
