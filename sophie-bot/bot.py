@@ -373,9 +373,10 @@ async def on_ready():
 
 
 def message_is_from_nick_in_allowed_place(message: discord.Message) -> bool:
-    """Sophie listens to two places:
-    - DMs from the allowed user
-    - The configured channel (if set), from the allowed user
+    """Sophie listens to:
+    - DMs from the allowed user (always)
+    - The configured `home` channel (if set), from the allowed user
+    - Any channel where she's @mentioned by the allowed user
     """
     if message.author.bot or message.author.id != ALLOWED_USER_ID:
         return False
@@ -383,7 +384,19 @@ def message_is_from_nick_in_allowed_place(message: discord.Message) -> bool:
         return True
     if ALLOWED_CHANNEL_ID and message.channel.id == ALLOWED_CHANNEL_ID:
         return True
+    if client.user in message.mentions:
+        return True
     return False
+
+
+def strip_bot_mention(content: str) -> str:
+    """Remove `<@id>` and `<@!id>` (nickname) mentions of the bot from a message."""
+    return (
+        content
+        .replace(f"<@{client.user.id}>", "")
+        .replace(f"<@!{client.user.id}>", "")
+        .strip()
+    )
 
 
 @client.event
@@ -392,7 +405,7 @@ async def on_message(message: discord.Message):
         return
 
     channel_id = str(message.channel.id)
-    content = message.content.strip()
+    content = strip_bot_mention(message.content).strip()
     if not content:
         return
 
