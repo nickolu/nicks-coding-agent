@@ -1,4 +1,6 @@
-FROM node:20-bookworm-slim
+FROM node:22-trixie-slim
+# Trixie (Debian 13) ships GLIBC 2.41 — required by precompiled `gws` binary
+# from @googleworkspace/cli (needs GLIBC 2.39+). Bookworm's 2.36 is too old.
 
 # System deps — slimmer than Howl's image (no gh, no Playwright, no Chromium).
 # Sophie writes notes and talks to Google APIs via the `gws` CLI; she never touches git/repos.

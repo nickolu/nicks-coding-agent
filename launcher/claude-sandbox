@@ -3,8 +3,8 @@ set -e
 CLAUDE_HOST=/home/claude/.claude-container
 PROJECTS=/home/claude/projects
 
-if [ ! -f "$CLAUDE_HOST/claude.json" ]; then
-  touch "$CLAUDE_HOST/claude.json"
+if [ ! -s "$CLAUDE_HOST/claude.json" ]; then
+  echo '{}' > "$CLAUDE_HOST/claude.json"
   chown claude:claude "$CLAUDE_HOST/claude.json"
   chmod 600 "$CLAUDE_HOST/claude.json"
 fi
