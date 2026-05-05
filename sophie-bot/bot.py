@@ -273,7 +273,9 @@ async def notify_listener():
 
     async def handle(reader, writer):
         try:
-            data = await reader.read(16384)
+            # Read until EOF — the client does SHUT_WR after sending the full payload.
+            # A bounded read() truncates large payloads (e.g. base64-encoded image attachments).
+            data = await reader.read()
             if not data:
                 return
             text = data.decode("utf-8", errors="replace").strip()
