@@ -27,6 +27,7 @@ OPENAI_MODELS = {
     "gpt-image-1",
     "gpt-image-1-mini",
     "gpt-image-1.5",
+    "gpt-image-2-2026-04-21",
     "chatgpt-image-latest",
     "dall-e-3",
 }
@@ -38,10 +39,36 @@ GEMINI_MODELS = {
 # Friendly aliases
 ALIASES = {
     "gemini": "gemini-2.5-flash-image",
-    "openai": "gpt-image-1",
+    "openai": "gpt-image-2-2026-04-21",
+    "gpt-image-2": "gpt-image-2-2026-04-21",
 }
 
 OPENAI_SIZES = {"auto", "1024x1024", "1536x1024", "1024x1536"}
+
+
+def validate_gpt_image_2_size(size: str) -> str:
+    """gpt-image-2 accepts custom WxH: edges multiples of 16, both <= 4000px,
+    total pixels in [655_360, 8_294_400], aspect within 1:3..3:1.
+    Returns a validated 'WxH' string, or raises SystemExit on hard errors.
+    Non-numeric inputs (e.g. 'auto') pass through to the API."""
+    m = re.fullmatch(r"\s*(\d+)x(\d+)\s*", size)
+    if not m:
+        return size
+    w, h = int(m.group(1)), int(m.group(2))
+    if w % 16 or h % 16:
+        w = max(16, round(w / 16) * 16)
+        h = max(16, round(h / 16) * 16)
+    if w > 4000 or h > 4000:
+        raise SystemExit(f"error: each edge must be <= 4000px (got {w}x{h})")
+    total = w * h
+    if total < 655_360:
+        raise SystemExit(f"error: total pixels must be >= 655,360 (got {total:,} for {w}x{h})")
+    if total > 8_294_400:
+        raise SystemExit(f"error: total pixels must be <= 8,294,400 (got {total:,} for {w}x{h})")
+    ratio = max(w, h) / min(w, h)
+    if ratio > 3.0:
+        raise SystemExit(f"error: aspect ratio must be within 1:3..3:1 (got {w}:{h})")
+    return f"{w}x{h}"
 SIZE_TO_ASPECT = {
     "1024x1024": "1:1",
     "1536x1024": "3:2",
@@ -67,7 +94,9 @@ def gen_openai(prompt: str, model: str, size: str) -> bytes:
     if not os.getenv("OPENAI_API_KEY"):
         raise SystemExit("error: OPENAI_API_KEY is not set in Sophie's .env")
     client = OpenAI()
-    if size not in OPENAI_SIZES:
+    if model.startswith("gpt-image-2"):
+        size = validate_gpt_image_2_size(size)
+    elif size not in OPENAI_SIZES:
         size = "auto"
     resp = client.images.generate(model=model, prompt=prompt, n=1, size=size)
     if not resp.data or not resp.data[0].b64_json:
