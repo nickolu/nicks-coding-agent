@@ -980,6 +980,7 @@ async def on_message(message: discord.Message):
                 RUNTIME["circuit_breaker_tripped_at"] = None
                 RUNTIME["circuit_breaker_reason"] = None
             save_runtime()
+            log.info(f"!autonomy {sub} (now: {autonomy_enabled()})")
             await message.channel.send(f"Autonomy is now **{sub}**.")
         elif sub == "status":
             qh = get_quiet_hours()
@@ -1015,6 +1016,7 @@ async def on_message(message: discord.Message):
             elif parse_quiet_hours(arg):
                 RUNTIME["quiet_hours_override"] = arg
                 save_runtime()
+                log.info(f"!quiet override set to {arg}")
                 await message.channel.send(f"Quiet hours set to **{arg}**.")
             else:
                 await message.channel.send("Usage: `!quiet [HH:MM-HH:MM | off | default]`")
@@ -1039,6 +1041,7 @@ async def on_message(message: discord.Message):
         RUNTIME["circuit_breaker_reason"] = "panic command"
         save_runtime()
         removed = cancel_all_autonomy_schedules()
+        log.warning(f"!panic invoked — autonomy off, {removed} autonomous schedule(s) cleared")
         await message.channel.send(
             f"\U0001f6d1 **Panic.** Autonomy off. {removed} autonomous schedule(s) cleared. "
             f"Explicit reminders kept."
