@@ -1,4 +1,5 @@
 {
-  "bot_token": "REPLACE_WITH_DISCORD_BOT_TOKEN",
-  "allowed_user_id": "REPLACE_WITH_YOUR_DISCORD_USER_ID"
+  "bot_token": "REPLACE_WITH_HOWL_DISCORD_BOT_TOKEN",
+  "allowed_user_id": "REPLACE_WITH_YOUR_DISCORD_USER_ID",
+  "allowed_channel_id": "REPLACE_WITH_PENDRAGON_HOWL_CHANNEL_ID_OR_REMOVE_THIS_LINE"
 }

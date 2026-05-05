@@ -32,6 +32,9 @@ with CONFIG_PATH.open() as f:
     CONFIG = json.load(f)
 ALLOWED_USER_ID = int(CONFIG["allowed_user_id"])
 TOKEN = CONFIG["bot_token"]
+# Optional: a "home" channel ID. If set, Howl responds to every message Nick posts
+# there. He can also @mention Howl in any channel to summon him. DMs always work.
+ALLOWED_CHANNEL_ID = int(CONFIG["allowed_channel_id"]) if CONFIG.get("allowed_channel_id") else None
 
 # Per-channel state: {channel_id: {"session_id": uuid, "first_call": bool}}
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -537,6 +540,7 @@ async def notify_listener():
 intents = discord.Intents.default()
 intents.message_content = True
 intents.dm_messages = True
+intents.guild_messages = True
 client = discord.Client(intents=intents)
 
 
@@ -544,21 +548,46 @@ client = discord.Client(intents=intents)
 async def on_ready():
     log.info(f"Logged in as {client.user} (id={client.user.id})")
     log.info(f"Allowed user id: {ALLOWED_USER_ID}")
+    if ALLOWED_CHANNEL_ID:
+        log.info(f"Home channel id: {ALLOWED_CHANNEL_ID}")
     if not hasattr(client, "_socket_task"):
         client._socket_task = asyncio.create_task(notify_listener())
 
 
+def message_is_from_nick_in_allowed_place(message: discord.Message) -> bool:
+    """Howl listens to:
+    - DMs from the allowed user (always)
+    - The configured home channel (if set), from the allowed user
+    - Any channel where he's @mentioned by the allowed user
+    """
+    if message.author.bot or message.author.id != ALLOWED_USER_ID:
+        return False
+    if isinstance(message.channel, discord.DMChannel):
+        return True
+    if ALLOWED_CHANNEL_ID and message.channel.id == ALLOWED_CHANNEL_ID:
+        return True
+    if client.user in message.mentions:
+        return True
+    return False
+
+
+def strip_bot_mention(content: str) -> str:
+    """Remove `<@id>` and `<@!id>` (nickname) mentions of the bot from a message."""
+    return (
+        content
+        .replace(f"<@{client.user.id}>", "")
+        .replace(f"<@!{client.user.id}>", "")
+        .strip()
+    )
+
+
 @client.event
 async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-    if message.author.id != ALLOWED_USER_ID:
-        return
-    if not isinstance(message.channel, discord.DMChannel):
+    if not message_is_from_nick_in_allowed_place(message):
         return
 
     channel_id = str(message.channel.id)
-    content = message.content.strip()
+    content = strip_bot_mention(message.content).strip()
     if not content:
         return
 
