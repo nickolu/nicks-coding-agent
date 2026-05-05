@@ -22,6 +22,7 @@ DOCKER_ARGS=(
   --rm "${TTY_FLAGS[@]}"
   --name "sophie-sandbox-$$"
   --hostname sophie-sandbox
+  -e "TZ=${TZ:-UTC}"
   -v "$SOPHIE_HOST:/home/sophie/.claude"
   -v "$SOPHIE_HOST/claude.json:/home/sophie/.claude.json"
   -v "$SOPHIE_HOST/gws-config:/home/sophie/.config/gws"
@@ -31,6 +32,7 @@ DOCKER_ARGS=(
   -v "$SOPHIE_HOST/sophie-watch:/usr/local/bin/sophie-watch:ro"
   -v "$SOPHIE_HOST/sophie-image:/usr/local/bin/sophie-image:ro"
   -v "$SOPHIE_HOST/sophie-attach:/usr/local/bin/sophie-attach:ro"
+  -v "$SOPHIE_HOST/sophie-schedule:/usr/local/bin/sophie-schedule:ro"
   -v "$NOTEBOOK:/notebook"
   --env-file "$SOPHIE_HOST/.env"
   -w /notebook

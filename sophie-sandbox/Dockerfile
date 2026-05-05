@@ -7,7 +7,7 @@ FROM node:22-trixie-slim
 # libsecret-1-0 + gnome-keyring give @googleworkspace/cli somewhere to put its OS-keyring credentials.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tmux curl ca-certificates python3 python3-pip python3-venv \
-    jq ripgrep fd-find less nano vim-tiny \
+    jq ripgrep fd-find less nano vim-tiny tzdata \
     libsecret-1-0 gnome-keyring dbus-x11 \
     && rm -rf /var/lib/apt/lists/*
 
