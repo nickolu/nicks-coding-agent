@@ -9,6 +9,8 @@ The watcher framework is kept (and renamed in the user-facing help) because it's
 generically useful for time-based reminders and polling Google Tasks / Calendar.
 """
 import asyncio
+import base64
+import io
 import json
 import logging
 import os
@@ -161,6 +163,17 @@ async def send_dm(msg: str):
     user = client.get_user(ALLOWED_USER_ID) or await client.fetch_user(ALLOWED_USER_ID)
     for chunk in split_discord(msg):
         await user.send(chunk)
+
+
+async def send_attachment(filename: str, data: bytes, caption: str = ""):
+    """Post a file to Nick — same routing as send_dm."""
+    file = discord.File(fp=io.BytesIO(data), filename=filename)
+    if ALLOWED_CHANNEL_ID:
+        channel = client.get_channel(ALLOWED_CHANNEL_ID) or await client.fetch_channel(ALLOWED_CHANNEL_ID)
+        await channel.send(content=caption or None, file=file)
+        return
+    user = client.get_user(ALLOWED_USER_ID) or await client.fetch_user(ALLOWED_USER_ID)
+    await user.send(content=caption or None, file=file)
 
 
 async def watcher_loop(watcher_id: str, info: dict):
@@ -319,6 +332,28 @@ async def notify_listener():
                     else:
                         WATCHERS[matches[0]]["task"].cancel()
                         result = f"ok: cancelled {matches[0][:8]}"
+                    try:
+                        writer.write(f"{result}\n".encode())
+                        await writer.drain()
+                    except (ConnectionResetError, BrokenPipeError):
+                        pass
+                    return
+
+                if ptype == "attach":
+                    fname = payload.get("filename", "attachment.bin")
+                    caption = payload.get("caption", "")
+                    try:
+                        data = base64.b64decode(payload.get("data_b64", ""))
+                    except Exception as e:
+                        result = f"error: bad base64 payload: {e}"
+                    else:
+                        try:
+                            await send_attachment(fname, data, caption=caption)
+                            result = f"ok: posted {fname} ({len(data)} bytes)"
+                            log.info(f"attach -> user: {fname} ({len(data)} bytes)")
+                        except Exception as e:
+                            result = f"error: send failed: {e}"
+                            log.exception("attach send failed")
                     try:
                         writer.write(f"{result}\n".encode())
                         await writer.drain()

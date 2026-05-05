@@ -14,6 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Claude Code + Google Workspace CLI (binary: `gws`, OAuth via `gws auth login`)
 RUN npm install -g @anthropic-ai/claude-code @googleworkspace/cli
 
+# Python deps for Sophie's tools (image generation via OpenAI + Google Gemini).
+# --break-system-packages because Debian's PEP-668 marker on system Python; safe in a single-purpose container.
+RUN pip install --no-cache-dir --break-system-packages openai google-genai
+
 # Non-root user — matches host `sophie` UID 1001.
 # `node` user in the base image has UID 1000 which would collide with Howl's `claude` user
 # if we ever shared a host volume, so we explicitly use 1001 here.

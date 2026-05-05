@@ -29,6 +29,8 @@ DOCKER_ARGS=(
   -v "/run/sophie-discord.sock:/run/sophie-discord.sock"
   -v "$SOPHIE_HOST/sophie-notify:/usr/local/bin/sophie-notify:ro"
   -v "$SOPHIE_HOST/sophie-watch:/usr/local/bin/sophie-watch:ro"
+  -v "$SOPHIE_HOST/sophie-image:/usr/local/bin/sophie-image:ro"
+  -v "$SOPHIE_HOST/sophie-attach:/usr/local/bin/sophie-attach:ro"
   -v "$NOTEBOOK:/notebook"
   --env-file "$SOPHIE_HOST/.env"
   -w /notebook

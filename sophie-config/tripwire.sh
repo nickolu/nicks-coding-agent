@@ -55,6 +55,9 @@ case "$tool" in
     path=$(echo "$payload" | jq -r ".tool_input.file_path // .tool_input.notebook_path // empty")
     case "$path" in
       /notebook|/notebook/*) allow "write_in_notebook" ;;
+      # Allow Claude Code's auto-memory system to write under ~/.claude/projects/<slug>/memory/.
+      # This is what persists Sophie's MEMORY.md / per-topic memory files across sessions.
+      /home/sophie/.claude/projects/*/memory|/home/sophie/.claude/projects/*/memory/*) allow "write_in_memory" ;;
       /home/sophie/.claude|/home/sophie/.claude/*) block "write to .claude config dir" ;;
       "") block "empty path" ;;
       *) block "write outside /notebook: $path" ;;
