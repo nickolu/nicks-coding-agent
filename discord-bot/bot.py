@@ -35,6 +35,12 @@ TOKEN = CONFIG["bot_token"]
 # Optional: a "home" channel ID. If set, Howl responds to every message Nick posts
 # there. He can also @mention Howl in any channel to summon him. DMs always work.
 ALLOWED_CHANNEL_ID = int(CONFIG["allowed_channel_id"]) if CONFIG.get("allowed_channel_id") else None
+# Optional: bot user IDs (e.g. Sophie) allowed to delegate tasks to Howl by
+# posting in the home channel. Messages from these bots are prefixed with a
+# source tag so Howl knows it's not Nick speaking.
+ALLOWED_BOT_USER_IDS: set[int] = {
+    int(uid) for uid in (CONFIG.get("allowed_bot_user_ids") or [])
+}
 
 # Per-channel state: {channel_id: {"session_id": uuid, "first_call": bool}}
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -556,21 +562,36 @@ async def on_ready():
         client._socket_task = asyncio.create_task(notify_listener())
 
 
-def message_is_from_nick_in_allowed_place(message: discord.Message) -> bool:
-    """Howl listens to:
+def message_is_from_authorized_sender(message: discord.Message) -> tuple[bool, str | None]:
+    """Returns (allowed, source_label).
+
+    Howl listens to:
     - DMs from the allowed user (always)
-    - The configured home channel (if set), from the allowed user
+    - The configured home channel (if set), from the allowed user OR allowed bots
     - Any channel where he's @mentioned by the allowed user
+
+    `source_label` is None for Nick (default), and set to a short string like
+    "Sophie" when the message comes from one of the allowed delegating bots —
+    on_message uses it to prefix the prompt so Howl knows not to treat the
+    message as if Nick were speaking.
     """
-    if message.author.bot or message.author.id != ALLOWED_USER_ID:
-        return False
-    if isinstance(message.channel, discord.DMChannel):
-        return True
-    if ALLOWED_CHANNEL_ID and message.channel.id == ALLOWED_CHANNEL_ID:
-        return True
-    if client.user in message.mentions:
-        return True
-    return False
+    if message.author.id == ALLOWED_USER_ID and not message.author.bot:
+        if isinstance(message.channel, discord.DMChannel):
+            return True, None
+        if ALLOWED_CHANNEL_ID and message.channel.id == ALLOWED_CHANNEL_ID:
+            return True, None
+        if client.user in message.mentions:
+            return True, None
+        return False, None
+    # Delegating-bot path (Sophie etc.) — only accepted in the home channel.
+    if (
+        message.author.bot
+        and message.author.id in ALLOWED_BOT_USER_IDS
+        and ALLOWED_CHANNEL_ID
+        and message.channel.id == ALLOWED_CHANNEL_ID
+    ):
+        return True, message.author.display_name or message.author.name or "bot"
+    return False, None
 
 
 def strip_bot_mention(content: str) -> str:
@@ -585,7 +606,8 @@ def strip_bot_mention(content: str) -> str:
 
 @client.event
 async def on_message(message: discord.Message):
-    if not message_is_from_nick_in_allowed_place(message):
+    allowed, source_label = message_is_from_authorized_sender(message)
+    if not allowed:
         return
 
     channel_id = str(message.channel.id)
@@ -593,13 +615,22 @@ async def on_message(message: discord.Message):
     if not content:
         return
 
+    # Strip the "[From Sophie]:" prefix Sophie's bot adds, if present —
+    # Howl already knows the source via `source_label`.
+    if source_label and content.startswith(f"[From {source_label}]:"):
+        content = content[len(f"[From {source_label}]:"):].strip()
+
+    # Only Nick can drive `!`-commands. Delegated messages (e.g. from Sophie)
+    # always fall through to "Forward to Claude" so Howl decides what to do.
+    nick_only = source_label is None
+
     # --- Commands ---
-    if content == "!new":
+    if nick_only and content == "!new":
         sid = new_session(channel_id)
         await message.channel.send(f"\U0001f195 New session started: `{sid[:8]}`")
         return
 
-    if content == "!status":
+    if nick_only and content == "!status":
         entry = STATE.get(channel_id)
         if not entry:
             await message.channel.send("No active session. Send a message to start one.")
@@ -609,7 +640,7 @@ async def on_message(message: discord.Message):
             await message.channel.send(f"Session: `{sid[:8]}`\nState: {state}")
         return
 
-    if content == "!logs":
+    if nick_only and content == "!logs":
         try:
             lines = TRIPWIRE_LOG.read_text().strip().splitlines()[-20:]
             body = "\n".join(lines) if lines else "(empty)"
@@ -618,7 +649,7 @@ async def on_message(message: discord.Message):
             await message.channel.send(f"log read error: {e}")
         return
 
-    if content == "!watchers":
+    if nick_only and content == "!watchers":
         if not WATCHERS:
             await message.channel.send("No active watchers.")
         else:
@@ -630,7 +661,7 @@ async def on_message(message: discord.Message):
             await message.channel.send("\n".join(lines))
         return
 
-    if content.startswith("!cancel "):
+    if nick_only and content.startswith("!cancel "):
         wid_prefix = content.split(None, 1)[1].strip()
         matches = [wid for wid in WATCHERS if wid.startswith(wid_prefix)]
         if not matches:
@@ -643,7 +674,7 @@ async def on_message(message: discord.Message):
         return
 
     # --- Auto mode ---
-    if content.startswith("!auto"):
+    if nick_only and content.startswith("!auto"):
         parts = content.split(None)
         # !auto stop
         if len(parts) >= 2 and parts[1] == "stop":
@@ -764,7 +795,7 @@ async def on_message(message: discord.Message):
         return
 
     # --- Help ---
-    if content == "!help":
+    if nick_only and content == "!help":
         await message.channel.send(
             "**Commands:**\n"
             "`!new` — start a fresh Claude session\n"
@@ -782,17 +813,23 @@ async def on_message(message: discord.Message):
         return
 
     # --- Forward to Claude ---
+    if source_label:
+        prompt = (
+            f"[From {source_label} \u2014 task delegated, not Nick speaking]: {content}"
+        )
+    else:
+        prompt = content
     lock = LOCKS.setdefault(channel_id, asyncio.Lock())
     async with lock:
         session_id, first_call = get_or_create_session(channel_id)
-        log.info(f"forwarding (channel={channel_id} session={session_id[:8]} first={first_call}): {content[:80]}")
+        log.info(f"forwarding (channel={channel_id} session={session_id[:8]} first={first_call} src={source_label or 'nick'}): {content[:80]}")
         try:
             await message.add_reaction("\u23f3")
         except Exception:
             pass
         try:
             async with message.channel.typing():
-                reply = await run_claude(session_id, first_call, content)
+                reply = await run_claude(session_id, first_call, prompt)
         finally:
             try:
                 await message.remove_reaction("\u23f3", client.user)

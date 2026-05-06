@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Print recent Discord activity since a point in time.
+
+Reads the JSONL logs the Sophie bridge writes to /var/lib/sophie-discord/.
+Sophie should run this at the start of every --invoke wakeup so she can see
+what Nick said or tapped while she was idle.
+
+Examples:
+  sophie-recent-dms                          # last 24h, inbound only
+  sophie-recent-dms --since-last-tick        # since last time Sophie ran
+  sophie-recent-dms --since 2h               # last 2 hours
+  sophie-recent-dms --since 2026-05-05T08:00 # absolute ISO 8601
+  sophie-recent-dms --tag water --since 6h   # outbound + reactions for "water"
+  sophie-recent-dms --format json --since 1h # machine-readable
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("SOPHIE_STATE_DIR", "/var/lib/sophie-discord"))
+INBOUND = STATE_DIR / "inbound-messages.jsonl"
+OUTBOUND = STATE_DIR / "outbound-messages.jsonl"
+REACTIONS = STATE_DIR / "reactions.jsonl"
+LAST_TICK = STATE_DIR / "last-tick.json"
+
+
+def parse_since(s: str) -> datetime:
+    """Accept ISO 8601 or a relative spec like '90m', '2h', '1d'."""
+    s = s.strip()
+    m = re.fullmatch(r"(\d+)\s*([mhd])", s)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        delta = {"m": timedelta(minutes=n), "h": timedelta(hours=n), "d": timedelta(days=n)}[unit]
+        return datetime.now(tz=timezone.utc) - delta
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def read_last_tick() -> datetime | None:
+    if not LAST_TICK.exists():
+        return None
+    try:
+        data = json.loads(LAST_TICK.read_text())
+        return parse_since(data["last_tick_utc"])
+    except Exception:
+        return None
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def filter_by_time(rows: list[dict], since: datetime) -> list[dict]:
+    out = []
+    for r in rows:
+        try:
+            ts = parse_since(r["ts"])
+        except Exception:
+            continue
+        if ts >= since:
+            out.append(r)
+    return out
+
+
+def fmt_local(ts_iso: str) -> str:
+    try:
+        dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        # No timezone conversion here — show in local TZ if available, else UTC.
+        return dt.astimezone().strftime("%H:%M")
+    except Exception:
+        return ts_iso
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--since", help="ISO 8601 or relative (e.g. 90m, 2h, 1d). Default: 24h.")
+    g.add_argument("--since-last-tick", action="store_true",
+                   help="Use the last time Sophie ran. Falls back to 24h if unknown.")
+    p.add_argument("--tag", help="Filter outbound + reactions by tag (water, stand, ...)")
+    p.add_argument("--include-outbound", action="store_true",
+                   help="Include Sophie's own outbound messages (always on with --tag).")
+    p.add_argument("--format", choices=("text", "json"), default="text")
+    args = p.parse_args()
+
+    if args.since_last_tick:
+        since = read_last_tick() or (datetime.now(tz=timezone.utc) - timedelta(hours=24))
+    elif args.since:
+        try:
+            since = parse_since(args.since)
+        except Exception as e:
+            print(f"sophie-recent-dms: bad --since {args.since!r}: {e}", file=sys.stderr)
+            return 2
+    else:
+        since = datetime.now(tz=timezone.utc) - timedelta(hours=24)
+
+    inbound = filter_by_time(read_jsonl(INBOUND), since)
+    outbound_all = filter_by_time(read_jsonl(OUTBOUND), since)
+    reactions_all = filter_by_time(read_jsonl(REACTIONS), since)
+
+    show_outbound = args.include_outbound or bool(args.tag)
+    if args.tag:
+        outbound = [r for r in outbound_all if r.get("tag") == args.tag]
+        # Reactions filter: by tag if recorded, else by message_id join with outbound
+        outbound_ids = {r["message_id"] for r in outbound_all if r.get("tag") == args.tag}
+        reactions = [
+            r for r in reactions_all
+            if r.get("tag") == args.tag or r.get("message_id") in outbound_ids
+        ]
+    else:
+        outbound = outbound_all if show_outbound else []
+        reactions = reactions_all
+
+    if args.format == "json":
+        print(json.dumps({
+            "since": since.isoformat(),
+            "inbound": inbound,
+            "outbound": outbound,
+            "reactions": reactions,
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    # Text format
+    parts = []
+    parts.append(f"Activity since {since.isoformat()}")
+    if args.tag:
+        parts.append(f"  (filtered to tag={args.tag!r})")
+
+    parts.append("")
+    parts.append(f"Inbound DMs from Nick ({len(inbound)}):")
+    if not inbound:
+        parts.append("  (none)")
+    for r in inbound:
+        parts.append(f"  {fmt_local(r['ts'])} — {r['content'][:240]}")
+
+    if show_outbound:
+        parts.append("")
+        parts.append(f"Outbound from Sophie ({len(outbound)}):")
+        if not outbound:
+            parts.append("  (none)")
+        for r in outbound:
+            tag = r.get("tag") or ""
+            tag_str = f" [{tag}]" if tag else ""
+            parts.append(f"  {fmt_local(r['ts'])}{tag_str} — {r['content'][:240]}")
+
+    parts.append("")
+    parts.append(f"Reactions from Nick ({len(reactions)}):")
+    if not reactions:
+        parts.append("  (none)")
+    for r in reactions:
+        tag = r.get("tag") or ""
+        tag_str = f" [{tag}]" if tag else ""
+        parts.append(f"  {fmt_local(r['ts'])} — {r['emoji']} on msg {r['message_id']}{tag_str}")
+
+    print("\n".join(parts))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

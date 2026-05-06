@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Hand a task to Howl by posting in his Discord channel.
+
+The message lands in #howl prefixed with "[From Sophie]:". Howl's bot is
+configured to accept Sophie as an authorized sender and will spawn a normal
+session to handle it. Nick sees the handoff in #howl in the open and can
+interrupt or redirect.
+
+Usage:
+  sophie-task-howl "Please file a GitHub issue in claude-bridge: title 'X', body 'Y'"
+  echo "Fix the bot reconnect bug" | sophie-task-howl
+
+Notes:
+  Be specific. Give Howl the repo, the goal, and any context. He doesn't have
+  your conversation with Nick — only what you send.
+"""
+import json
+import socket
+import sys
+
+SOCKET = "/run/sophie-discord.sock"
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if args == ["-h"] or args == ["--help"]:
+        print(__doc__)
+        return 0
+    msg = " ".join(args).strip() if args else sys.stdin.read().strip()
+    if not msg:
+        print("sophie-task-howl: empty task — nothing sent", file=sys.stderr)
+        return 1
+
+    payload = {"type": "post_to_howl", "content": msg}
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(SOCKET)
+        s.sendall(json.dumps(payload).encode("utf-8"))
+        s.shutdown(socket.SHUT_WR)
+        chunks = []
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        s.close()
+    except FileNotFoundError:
+        print(f"sophie-task-howl: socket {SOCKET} not found (bot not running?)", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"sophie-task-howl: {e}", file=sys.stderr)
+        return 1
+
+    resp = b"".join(chunks).decode("utf-8", errors="replace").strip()
+    if resp.startswith("ok:"):
+        msg_id = resp.split(":", 1)[1]
+        print(f"Sent to #howl (message id {msg_id}).")
+        return 0
+    print(resp or "(no response from bot)", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -26,9 +26,14 @@ from zoneinfo import ZoneInfo
 import discord
 
 CONFIG_PATH = Path("/etc/sophie-discord/config.json")
-STATE_PATH = Path("/var/lib/sophie-discord/sessions.json")
-SCHEDULES_PATH = Path("/var/lib/sophie-discord/schedules.json")
-RUNTIME_PATH = Path("/var/lib/sophie-discord/runtime.json")
+STATE_DIR = Path("/var/lib/sophie-discord")
+STATE_PATH = STATE_DIR / "sessions.json"
+SCHEDULES_PATH = STATE_DIR / "schedules.json"
+RUNTIME_PATH = STATE_DIR / "runtime.json"
+INBOUND_LOG = STATE_DIR / "inbound-messages.jsonl"
+OUTBOUND_LOG = STATE_DIR / "outbound-messages.jsonl"
+REACTIONS_LOG = STATE_DIR / "reactions.jsonl"
+LAST_TICK_PATH = STATE_DIR / "last-tick.json"
 TRIPWIRE_LOG = Path("/home/sophie/.claude-container/tripwire.log")
 SOPHIE_CMD = "/usr/local/bin/sophie-sandbox"
 NOTIFY_SOCKET = "/run/sophie-discord.sock"
@@ -58,6 +63,8 @@ TOKEN = CONFIG["bot_token"]
 # Optional: restrict to a specific channel ID (e.g. #sophie in Pendragon & Co).
 # If unset, accepts DMs and any channel where the bot is mentioned/posted.
 ALLOWED_CHANNEL_ID = int(CONFIG["allowed_channel_id"]) if CONFIG.get("allowed_channel_id") else None
+# Optional: ID of Howl's home channel. Required for sophie-task-howl handoffs.
+HOWL_CHANNEL_ID = int(CONFIG["howl_channel_id"]) if CONFIG.get("howl_channel_id") else None
 TIMEZONE = ZoneInfo(CONFIG.get("timezone", "America/Los_Angeles"))
 QUIET_HOURS_DEFAULT = CONFIG.get("quiet_hours") or None  # "HH:MM-HH:MM" or None
 
@@ -103,6 +110,69 @@ DM_LOG: deque[float] = deque()
 # Serialize all sophie-sandbox subprocess invocations — two parallel sessions
 # would race on the shared /notebook bind mount.
 SOPHIE_LOCK = asyncio.Lock()
+
+# In-memory tail of recently sent outbound messages so on_reaction_add can
+# resolve a message_id back to its `tag` (e.g. "water") without scanning the
+# JSONL log on every tap. Bounded — older entries fall out; reactions on those
+# get logged with tag="" and can still be joined later via message_id.
+OUTBOUND_TAIL: deque[tuple[int, str]] = deque(maxlen=500)
+
+
+def _append_jsonl(path: Path, row: dict) -> None:
+    """Append a single JSON row + newline. No locking — single writer process."""
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        log.exception(f"failed to append {path.name}")
+
+
+def _ensure_log_files() -> None:
+    """Create the JSONL log files at startup with restrictive perms."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    for p in (INBOUND_LOG, OUTBOUND_LOG, REACTIONS_LOG):
+        if not p.exists():
+            p.touch(mode=0o600)
+        else:
+            try:
+                os.chmod(p, 0o600)
+            except Exception:
+                pass
+
+
+def _resolve_tag(message_id: int) -> str:
+    """Look up a Sophie outbound message_id in the in-memory tail; return tag or ''."""
+    for mid, tag in reversed(OUTBOUND_TAIL):
+        if mid == message_id:
+            return tag
+    return ""
+
+
+def _record_outbound(channel_id: int, message_id: int, content: str, tag: str = "") -> None:
+    """Persist one outbound row + remember it in the tail cache."""
+    _append_jsonl(OUTBOUND_LOG, {
+        "ts": now_iso(),
+        "channel_id": int(channel_id),
+        "message_id": int(message_id),
+        "content": content,
+        "tag": tag,
+    })
+    OUTBOUND_TAIL.append((int(message_id), tag))
+
+
+def now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _write_last_tick() -> None:
+    """Mark 'Sophie was just awake'. Called after every successful run_sophie()."""
+    try:
+        LAST_TICK_PATH.write_text(json.dumps({"last_tick_utc": now_iso()}))
+    except Exception:
+        log.exception("failed to write last-tick.json")
+
+
+_ensure_log_files()
 
 
 def save_state():
@@ -163,7 +233,11 @@ async def run_sophie(session_id: str, first_call: bool, prompt: str) -> str:
             return f"[bot error: {e}]"
 
     async with SOPHIE_LOCK:
-        return await asyncio.to_thread(_run)
+        result = await asyncio.to_thread(_run)
+    # Mark Sophie as having just been awake — sophie-recent-dms --since-last-tick
+    # uses this to know what's new since she last had context.
+    _write_last_tick()
+    return result
 
 
 def split_discord(text: str, limit: int = 1900) -> list[str]:
@@ -210,28 +284,76 @@ async def run_check_command(command: str) -> str:
     return await asyncio.to_thread(_run)
 
 
-async def send_dm(msg: str):
+async def send_dm(msg: str, *, tag: str = "", reactions: list[str] | None = None):
     """Send a message to Nick — DM if no allowed channel is configured,
-    else post in the allowed channel."""
+    else post in the allowed channel.
+
+    Each chunk is persisted to outbound-messages.jsonl. If `reactions` are
+    provided, they're pre-attached to the LAST chunk so Nick can tap-to-ack
+    (e.g. a 💧 next to a "water?" nudge). `tag` is stored on the outbound row
+    so reactions can be grouped by topic ("water", "stand", etc.) later.
+    """
     if ALLOWED_CHANNEL_ID:
         channel = client.get_channel(ALLOWED_CHANNEL_ID) or await client.fetch_channel(ALLOWED_CHANNEL_ID)
-        for chunk in split_discord(msg):
-            await channel.send(chunk)
-        return
-    user = client.get_user(ALLOWED_USER_ID) or await client.fetch_user(ALLOWED_USER_ID)
-    for chunk in split_discord(msg):
-        await user.send(chunk)
+        target = channel
+    else:
+        target = client.get_user(ALLOWED_USER_ID) or await client.fetch_user(ALLOWED_USER_ID)
+    chunks = split_discord(msg)
+    sent_messages = []
+    for chunk in chunks:
+        sent = await target.send(chunk)
+        sent_messages.append(sent)
+        try:
+            _record_outbound(sent.channel.id, sent.id, chunk, tag=tag)
+        except Exception:
+            log.exception("send_dm: failed to record outbound")
+    if reactions and sent_messages:
+        last = sent_messages[-1]
+        for emoji in reactions:
+            try:
+                await last.add_reaction(emoji)
+            except Exception as e:
+                log.warning(f"send_dm: failed to add reaction {emoji!r}: {e}")
 
 
 async def send_attachment(filename: str, data: bytes, caption: str = ""):
     """Post a file to Nick — same routing as send_dm."""
     file = discord.File(fp=io.BytesIO(data), filename=filename)
     if ALLOWED_CHANNEL_ID:
-        channel = client.get_channel(ALLOWED_CHANNEL_ID) or await client.fetch_channel(ALLOWED_CHANNEL_ID)
-        await channel.send(content=caption or None, file=file)
-        return
-    user = client.get_user(ALLOWED_USER_ID) or await client.fetch_user(ALLOWED_USER_ID)
-    await user.send(content=caption or None, file=file)
+        target = client.get_channel(ALLOWED_CHANNEL_ID) or await client.fetch_channel(ALLOWED_CHANNEL_ID)
+    else:
+        target = client.get_user(ALLOWED_USER_ID) or await client.fetch_user(ALLOWED_USER_ID)
+    sent = await target.send(content=caption or None, file=file)
+    try:
+        _record_outbound(sent.channel.id, sent.id, f"[attach:{filename}] {caption}".strip(), tag="attach")
+    except Exception:
+        log.exception("send_attachment: failed to record outbound")
+
+
+async def post_to_howl(content: str) -> str:
+    """Post a Sophie-authored task into Howl's home channel.
+
+    Returns "ok:<message_id>" on success, "error: ..." on failure.
+    Howl's bot is responsible for accepting bot-authored messages from Sophie's
+    user ID via its `allowed_bot_user_ids` config.
+    """
+    if not HOWL_CHANNEL_ID:
+        return "error: howl_channel_id not configured"
+    try:
+        channel = client.get_channel(HOWL_CHANNEL_ID) or await client.fetch_channel(HOWL_CHANNEL_ID)
+    except Exception as e:
+        return f"error: cannot fetch howl channel: {e}"
+    body = f"[From Sophie]: {content}"
+    try:
+        sent_messages = []
+        for chunk in split_discord(body):
+            sent = await channel.send(chunk)
+            sent_messages.append(sent)
+            _record_outbound(sent.channel.id, sent.id, chunk, tag="howl-task")
+        return f"ok:{sent_messages[-1].id}"
+    except Exception as e:
+        log.exception("post_to_howl failed")
+        return f"error: send failed: {e}"
 
 
 async def watcher_loop(watcher_id: str, info: dict):
@@ -834,14 +956,38 @@ async def notify_listener():
                         pass
                     return
 
-                # Default: treat as notification
+                if ptype == "post_to_howl":
+                    content = (payload.get("content") or payload.get("message") or "").strip()
+                    if not content:
+                        result = "error: post_to_howl requires non-empty content"
+                    else:
+                        result = await post_to_howl(content)
+                    log.info(f"post_to_howl -> {result[:80]}")
+                    try:
+                        writer.write(f"{result}\n".encode())
+                        await writer.drain()
+                    except (ConnectionResetError, BrokenPipeError):
+                        pass
+                    return
+
+                # Default: treat as notification (with optional --track reaction support)
                 msg = payload.get("message", "")
+                tag = (payload.get("track") or "").strip()
+                reactions_field = payload.get("reactions")
+                if isinstance(reactions_field, str):
+                    reactions_list = [e.strip() for e in reactions_field.split(",") if e.strip()]
+                elif isinstance(reactions_field, list):
+                    reactions_list = [str(e) for e in reactions_field if str(e).strip()]
+                else:
+                    reactions_list = []
             else:
                 msg = text
+                tag = ""
+                reactions_list = []
 
             if msg:
-                await send_dm(msg)
-                log.info(f"notify -> user: {msg[:80]}")
+                await send_dm(msg, tag=tag, reactions=reactions_list or None)
+                log.info(f"notify -> user: {msg[:80]} tag={tag or '-'} reactions={reactions_list or '-'}")
                 record_unsolicited_dm()
             try:
                 writer.write(b"ok\n")
@@ -920,6 +1066,16 @@ async def on_message(message: discord.Message):
     content = strip_bot_mention(message.content).strip()
     if not content:
         return
+
+    # Persist before forwarding — even bot commands like !panic count as
+    # context worth seeing later via sophie-recent-dms.
+    _append_jsonl(INBOUND_LOG, {
+        "ts": now_iso(),
+        "channel_id": int(message.channel.id),
+        "message_id": int(message.id),
+        "author_id": int(message.author.id),
+        "content": content,
+    })
 
     # --- Commands ---
     if content == "!new":
@@ -1092,6 +1248,29 @@ async def on_message(message: discord.Message):
             pass
         for chunk in split_discord(reply):
             await message.channel.send(chunk)
+
+
+@client.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    """Persist reactions Nick adds to Sophie's messages so habit nudges close
+    the loop. Uses raw event so reactions on uncached messages still fire.
+    """
+    if payload.user_id != ALLOWED_USER_ID:
+        return
+    try:
+        emoji = str(payload.emoji)
+        message_id = int(payload.message_id)
+        tag = _resolve_tag(message_id)
+        _append_jsonl(REACTIONS_LOG, {
+            "ts": now_iso(),
+            "message_id": message_id,
+            "channel_id": int(payload.channel_id),
+            "emoji": emoji,
+            "tag": tag,
+        })
+        log.info(f"reaction logged: {emoji} on {message_id} (tag={tag or '-'})")
+    except Exception:
+        log.exception("on_raw_reaction_add: failed to log reaction")
 
 
 client.run(TOKEN, log_handler=None)
