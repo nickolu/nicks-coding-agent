@@ -167,6 +167,12 @@ def main() -> int:
             tag_str = f" [{tag}]" if tag else ""
             parts.append(f"  {fmt_local(r['ts'])}{tag_str} — {r['content'][:240]}")
 
+    # Build a message_id → outbound row lookup so reactions can show *what*
+    # Nick was reacting to, not just the bare message_id. Read the full
+    # outbound log (no time filter) — file is small and this enriches even
+    # reactions whose source message has aged out of the --since window.
+    outbound_by_id = {r.get("message_id"): r for r in read_jsonl(OUTBOUND)}
+
     parts.append("")
     parts.append(f"Reactions from Nick ({len(reactions)}):")
     if not reactions:
@@ -174,7 +180,13 @@ def main() -> int:
     for r in reactions:
         tag = r.get("tag") or ""
         tag_str = f" [{tag}]" if tag else ""
-        parts.append(f"  {fmt_local(r['ts'])} — {r['emoji']} on msg {r['message_id']}{tag_str}")
+        src = outbound_by_id.get(r.get("message_id"))
+        if src and (src.get("content") or "").strip():
+            snippet = " ".join((src["content"] or "").split())[:60]
+            on_str = f' on "{snippet}"'
+        else:
+            on_str = f" on msg {r['message_id']}"
+        parts.append(f"  {fmt_local(r['ts'])} — {r['emoji']}{on_str}{tag_str}")
 
     print("\n".join(parts))
     return 0
