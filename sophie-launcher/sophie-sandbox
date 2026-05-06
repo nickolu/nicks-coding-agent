@@ -35,6 +35,7 @@ DOCKER_ARGS=(
   -v "$SOPHIE_HOST/sophie-attach:/usr/local/bin/sophie-attach:ro"
   -v "$SOPHIE_HOST/sophie-schedule:/usr/local/bin/sophie-schedule:ro"
   -v "$SOPHIE_HOST/sophie-recent-dms:/usr/local/bin/sophie-recent-dms:ro"
+  -v "$SOPHIE_HOST/sophie-recent-howl:/usr/local/bin/sophie-recent-howl:ro"
   -v "$SOPHIE_HOST/sophie-task-howl:/usr/local/bin/sophie-task-howl:ro"
   -v "$NOTEBOOK:/notebook"
   --env-file "$SOPHIE_HOST/.env"

@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Print recent #howl activity since a point in time.
+
+Reads from /var/lib/sophie-discord/howl-channel.jsonl (other agents' messages
+in #howl) and merges in Sophie's own outbound-messages.jsonl rows tagged
+"howl-task" so the full thread is visible in chronological order.
+
+Sophie should run this after `sophie-task-howl` whenever she wants to see if
+Howl replied, or use `--since-last-task` to pick up from her most recent
+delegation.
+
+Examples:
+  sophie-recent-howl                          # last 24h
+  sophie-recent-howl --since-last-task        # since most recent sophie-task-howl
+  sophie-recent-howl --since 30m              # last 30 minutes
+  sophie-recent-howl --format json --since 1h
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("SOPHIE_STATE_DIR", "/var/lib/sophie-discord"))
+HOWL_CHANNEL = STATE_DIR / "howl-channel.jsonl"
+OUTBOUND = STATE_DIR / "outbound-messages.jsonl"
+LAST_TASK = STATE_DIR / "last-task.json"
+
+
+def parse_since(s: str) -> datetime:
+    s = s.strip()
+    m = re.fullmatch(r"(\d+)\s*([mhd])", s)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        delta = {"m": timedelta(minutes=n), "h": timedelta(hours=n), "d": timedelta(days=n)}[unit]
+        return datetime.now(tz=timezone.utc) - delta
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def read_last_task() -> datetime | None:
+    if not LAST_TASK.exists():
+        return None
+    try:
+        data = json.loads(LAST_TASK.read_text())
+        return parse_since(data["last_task_utc"])
+    except Exception:
+        return None
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def filter_by_time(rows: list[dict], since: datetime) -> list[dict]:
+    out = []
+    for r in rows:
+        try:
+            ts = parse_since(r["ts"])
+        except Exception:
+            continue
+        if ts >= since:
+            out.append(r)
+    return out
+
+
+def fmt_local(ts_iso: str) -> str:
+    try:
+        dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        return dt.astimezone().strftime("%H:%M")
+    except Exception:
+        return ts_iso
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--since", help="ISO 8601 or relative (e.g. 30m, 2h, 1d). Default: 24h.")
+    g.add_argument("--since-last-task", action="store_true",
+                   help="Use the timestamp of the most recent sophie-task-howl. Falls back to 24h.")
+    p.add_argument("--format", choices=("text", "json"), default="text")
+    args = p.parse_args()
+
+    if args.since_last_task:
+        since = read_last_task() or (datetime.now(tz=timezone.utc) - timedelta(hours=24))
+    elif args.since:
+        try:
+            since = parse_since(args.since)
+        except Exception as e:
+            print(f"sophie-recent-howl: bad --since {args.since!r}: {e}", file=sys.stderr)
+            return 2
+    else:
+        since = datetime.now(tz=timezone.utc) - timedelta(hours=24)
+
+    # #howl traffic from non-Sophie authors
+    howl_rows = filter_by_time(read_jsonl(HOWL_CHANNEL), since)
+    # Sophie's own outbound delegations to #howl (tag=howl-task)
+    sophie_rows = [
+        r for r in filter_by_time(read_jsonl(OUTBOUND), since)
+        if r.get("tag") == "howl-task"
+    ]
+
+    # Merge into a unified thread sorted by ts. Annotate author label.
+    merged = []
+    for r in sophie_rows:
+        merged.append({
+            "ts": r["ts"],
+            "author": "Sophie",
+            "is_bot": True,
+            "content": r.get("content", ""),
+            "message_id": r.get("message_id"),
+        })
+    for r in howl_rows:
+        merged.append({
+            "ts": r["ts"],
+            "author": r.get("author_name") or "?",
+            "is_bot": bool(r.get("is_bot", False)),
+            "content": r.get("content", ""),
+            "message_id": r.get("message_id"),
+        })
+    merged.sort(key=lambda x: x["ts"])
+
+    if args.format == "json":
+        print(json.dumps({
+            "since": since.isoformat(),
+            "messages": merged,
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    parts = []
+    parts.append(f"#howl activity since {since.isoformat()} ({len(merged)} messages):")
+    if not merged:
+        parts.append("  (none)")
+    else:
+        # Pad author column for readable alignment.
+        author_w = max((len(m["author"]) for m in merged), default=6)
+        for m in merged:
+            content_one_line = " ".join(m["content"].split())
+            parts.append(
+                f"  {fmt_local(m['ts'])}  {m['author']:<{author_w}}  — {content_one_line[:240]}"
+            )
+
+    print("\n".join(parts))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -33,7 +33,9 @@ RUNTIME_PATH = STATE_DIR / "runtime.json"
 INBOUND_LOG = STATE_DIR / "inbound-messages.jsonl"
 OUTBOUND_LOG = STATE_DIR / "outbound-messages.jsonl"
 REACTIONS_LOG = STATE_DIR / "reactions.jsonl"
+HOWL_LOG = STATE_DIR / "howl-channel.jsonl"
 LAST_TICK_PATH = STATE_DIR / "last-tick.json"
+LAST_TASK_PATH = STATE_DIR / "last-task.json"
 TRIPWIRE_LOG = Path("/home/sophie/.claude-container/tripwire.log")
 SOPHIE_CMD = "/usr/local/bin/sophie-sandbox"
 NOTIFY_SOCKET = "/run/sophie-discord.sock"
@@ -132,7 +134,7 @@ def _ensure_log_files() -> None:
     container (which runs as UID 1001, sophie) can read via the read-only bind
     mount — the bot itself runs as root, so 600 would block her."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    for p in (INBOUND_LOG, OUTBOUND_LOG, REACTIONS_LOG):
+    for p in (INBOUND_LOG, OUTBOUND_LOG, REACTIONS_LOG, HOWL_LOG):
         if not p.exists():
             p.touch(mode=0o644)
         try:
@@ -351,6 +353,10 @@ async def post_to_howl(content: str) -> str:
             sent = await channel.send(chunk)
             sent_messages.append(sent)
             _record_outbound(sent.channel.id, sent.id, chunk, tag="howl-task")
+        try:
+            LAST_TASK_PATH.write_text(json.dumps({"last_task_utc": now_iso()}))
+        except Exception:
+            log.exception("failed to write last-task.json")
         return f"ok:{sent_messages[-1].id}"
     except Exception as e:
         log.exception("post_to_howl failed")
@@ -1060,6 +1066,30 @@ def strip_bot_mention(content: str) -> str:
 
 @client.event
 async def on_message(message: discord.Message):
+    # Capture #howl traffic for sophie-recent-howl regardless of author —
+    # Sophie's bot is in the server with message_content intent so she sees
+    # everything posted there. Skip her own outbound (already in
+    # outbound-messages.jsonl with tag="howl-task").
+    if (
+        HOWL_CHANNEL_ID
+        and message.channel.id == HOWL_CHANNEL_ID
+        and message.author.id != client.user.id
+    ):
+        try:
+            _append_jsonl(HOWL_LOG, {
+                "ts": now_iso(),
+                "channel_id": int(message.channel.id),
+                "message_id": int(message.id),
+                "author_id": int(message.author.id),
+                "author_name": message.author.display_name or message.author.name,
+                "is_bot": bool(message.author.bot),
+                "content": message.content,
+            })
+        except Exception:
+            log.exception("on_message: failed to log howl traffic")
+        # Fall through — Nick mentioning Sophie in #howl still hits her
+        # normal handler below.
+
     if not message_is_from_nick_in_allowed_place(message):
         return
 

@@ -84,6 +84,7 @@ if id sophie >/dev/null 2>&1; then
   install_file sophie-tools/sophie-attach             /home/sophie/.claude-container/sophie-attach        sophie sophie 0755
   install_file sophie-tools/sophie-schedule           /home/sophie/.claude-container/sophie-schedule      sophie sophie 0755
   install_file sophie-tools/sophie-recent-dms         /home/sophie/.claude-container/sophie-recent-dms    sophie sophie 0755
+  install_file sophie-tools/sophie-recent-howl        /home/sophie/.claude-container/sophie-recent-howl   sophie sophie 0755
   install_file sophie-tools/sophie-task-howl          /home/sophie/.claude-container/sophie-task-howl     sophie sophie 0755
   install_file sophie-systemd/sophie-discord.service  /etc/systemd/system/sophie-discord.service          root   root   0644
 else
