@@ -128,16 +128,17 @@ def _append_jsonl(path: Path, row: dict) -> None:
 
 
 def _ensure_log_files() -> None:
-    """Create the JSONL log files at startup with restrictive perms."""
+    """Create the JSONL log files at startup. Mode 0o644 so Sophie's sandbox
+    container (which runs as UID 1001, sophie) can read via the read-only bind
+    mount — the bot itself runs as root, so 600 would block her."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     for p in (INBOUND_LOG, OUTBOUND_LOG, REACTIONS_LOG):
         if not p.exists():
-            p.touch(mode=0o600)
-        else:
-            try:
-                os.chmod(p, 0o600)
-            except Exception:
-                pass
+            p.touch(mode=0o644)
+        try:
+            os.chmod(p, 0o644)
+        except Exception:
+            pass
 
 
 def _resolve_tag(message_id: int) -> str:
