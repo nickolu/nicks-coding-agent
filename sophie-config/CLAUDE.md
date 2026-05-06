@@ -162,3 +162,11 @@ Don't delegate routine engineering questions you could answer yourself — only 
 - If you're already on a wakeup tick, just run `sophie-recent-howl --since-last-task` directly.
 
 Pull-on-wake by design — Howl posting in #howl never wakes you. You read his messages when you're already running. This is what keeps the two of you from looping each other to death.
+
+**Loop safeguards (the bridge enforces these — work with them, not around them):**
+
+1. **Rate limit** — `sophie-task-howl` is throttled to one delegation per 5 minutes (configurable). If you call it again too soon you'll see `error: rate-limited, Xs until next sophie-task-howl allowed`. Just wait it out — the throttle exists because rapid-fire delegation almost always means you're in a confused-loop pattern.
+
+2. **Hop limit** — at most 2 consecutive `sophie-task-howl` calls without Nick speaking in either #howl or your DM channel. After 2, the bridge rejects further delegations and DMs Nick. The counter resets the moment Nick chimes in anywhere you can see him. This is the belt to your suspenders: the architecture (you don't get push-woken by Howl) already breaks the loop, but the hop limit catches the case where you decide on a wakeup to chain delegations without checking in.
+
+3. **Autonomy gate** — `sophie-task-howl` refuses entirely when you're running on an `--autonomy` wakeup tick (the bridge sets `SOPHIE_AUTONOMY=1` in your env). Delegate only when (a) Nick explicitly asked in conversation, or (b) you're processing a task he authorized via `active_tasks.md` flagged as delegate-OK. If you have such authorization, override per-call: `SOPHIE_TASK_HOWL_FORCE=1 sophie-task-howl "<task>"`. Don't bypass casually — the gate exists to keep autonomy ticks from spawning Howl work without Nick's knowledge.

@@ -15,6 +15,7 @@ Notes:
   your conversation with Nick — only what you send.
 """
 import json
+import os
 import socket
 import sys
 
@@ -30,6 +31,21 @@ def main() -> int:
     if not msg:
         print("sophie-task-howl: empty task — nothing sent", file=sys.stderr)
         return 1
+
+    # Soft autonomy gate: refuse during unattended autonomy ticks unless
+    # explicitly authorized. The bridge sets SOPHIE_AUTONOMY=1 when firing
+    # an invoke schedule with pause_when_off=True. Sophie can override per
+    # invocation via SOPHIE_TASK_HOWL_FORCE=1 when she has clear authorization
+    # (e.g. an active_tasks.md entry Nick flagged for delegation).
+    if os.environ.get("SOPHIE_AUTONOMY") == "1" and os.environ.get("SOPHIE_TASK_HOWL_FORCE") != "1":
+        sys.stderr.write(
+            "sophie-task-howl: refusing to delegate from an autonomy tick.\n"
+            "Loop-safety: Sophie should only delegate when Nick is in the conversation\n"
+            "or has explicitly authorized the task.\n"
+            "If you have explicit authorization, override with:\n"
+            "  SOPHIE_TASK_HOWL_FORCE=1 sophie-task-howl \"<task>\"\n"
+        )
+        return 2
 
     payload = {"type": "post_to_howl", "content": msg}
     try:

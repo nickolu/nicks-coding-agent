@@ -23,6 +23,7 @@ DOCKER_ARGS=(
   --name "sophie-sandbox-$$"
   --hostname sophie-sandbox
   -e "TZ=${TZ:-UTC}"
+  -e "SOPHIE_AUTONOMY=${SOPHIE_AUTONOMY:-}"
   -v "$SOPHIE_HOST:/home/sophie/.claude"
   -v "$SOPHIE_HOST/claude.json:/home/sophie/.claude.json"
   -v "$SOPHIE_HOST/gws-config:/home/sophie/.config/gws"

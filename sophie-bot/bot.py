@@ -67,6 +67,9 @@ TOKEN = CONFIG["bot_token"]
 ALLOWED_CHANNEL_ID = int(CONFIG["allowed_channel_id"]) if CONFIG.get("allowed_channel_id") else None
 # Optional: ID of Howl's home channel. Required for sophie-task-howl handoffs.
 HOWL_CHANNEL_ID = int(CONFIG["howl_channel_id"]) if CONFIG.get("howl_channel_id") else None
+# Sophie→Howl loop safeguards. Defaults are intentionally tight; relax via config.
+HOWL_TASK_RATE_LIMIT_SEC = int(CONFIG.get("howl_task_rate_limit_sec", 300))
+HOWL_MAX_CONSECUTIVE_HOPS = int(CONFIG.get("howl_max_consecutive_hops", 2))
 TIMEZONE = ZoneInfo(CONFIG.get("timezone", "America/Los_Angeles"))
 QUIET_HOURS_DEFAULT = CONFIG.get("quiet_hours") or None  # "HH:MM-HH:MM" or None
 
@@ -118,6 +121,14 @@ SOPHIE_LOCK = asyncio.Lock()
 # JSONL log on every tap. Bounded — older entries fall out; reactions on those
 # get logged with tag="" and can still be joined later via message_id.
 OUTBOUND_TAIL: deque[tuple[int, str]] = deque(maxlen=500)
+
+# Sophie→Howl loop safeguards (in-memory, bridge-enforced).
+# `_last_howl_task_ts` is monotonic-ish wall time of the last successful
+# post_to_howl. `_consecutive_sophie_hops` increments on each delegation and
+# resets to 0 whenever Nick speaks anywhere Sophie can see him. Restored on
+# startup from last-task.json so a quick restart doesn't reset the rate limit.
+_last_howl_task_ts: float = 0.0
+_consecutive_sophie_hops: int = 0
 
 
 def _append_jsonl(path: Path, row: dict) -> None:
@@ -178,6 +189,26 @@ def _write_last_tick() -> None:
 _ensure_log_files()
 
 
+def _restore_last_howl_task_ts() -> None:
+    """Restore the rate-limit clock from last-task.json so a quick bot
+    restart doesn't accidentally clear an in-progress 5-min throttle."""
+    global _last_howl_task_ts
+    if not LAST_TASK_PATH.exists():
+        return
+    try:
+        data = json.loads(LAST_TASK_PATH.read_text())
+        ts_iso = data.get("last_task_utc")
+        if not ts_iso:
+            return
+        dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        _last_howl_task_ts = dt.timestamp()
+    except Exception:
+        log.exception("failed to restore last-task.json on startup")
+
+
+_restore_last_howl_task_ts()
+
+
 def save_state():
     STATE_PATH.write_text(json.dumps(STATE, indent=2))
 
@@ -209,8 +240,18 @@ def new_session(channel_id: str) -> str:
     return STATE[channel_id]["session_id"]
 
 
-async def run_sophie(session_id: str, first_call: bool, prompt: str) -> str:
-    """Run sophie-sandbox -p in a thread (blocking subprocess) and return stdout."""
+async def run_sophie(
+    session_id: str,
+    first_call: bool,
+    prompt: str,
+    *,
+    autonomy_mode: bool = False,
+) -> str:
+    """Run sophie-sandbox -p in a thread (blocking subprocess) and return stdout.
+
+    `autonomy_mode=True` sets SOPHIE_AUTONOMY=1 in the child env so tools like
+    sophie-task-howl can refuse risky actions during unattended ticks.
+    """
     if first_call:
         args = [SOPHIE_CMD, "-p", "--session-id", session_id, prompt]
     else:
@@ -219,6 +260,8 @@ async def run_sophie(session_id: str, first_call: bool, prompt: str) -> str:
     def _run():
         env = os.environ.copy()
         env["TZ"] = TIMEZONE.key
+        if autonomy_mode:
+            env["SOPHIE_AUTONOMY"] = "1"
         try:
             r = subprocess.run(
                 args,
@@ -339,9 +382,44 @@ async def post_to_howl(content: str) -> str:
     Returns "ok:<message_id>" on success, "error: ..." on failure.
     Howl's bot is responsible for accepting bot-authored messages from Sophie's
     user ID via its `allowed_bot_user_ids` config.
+
+    Enforces two loop safeguards:
+      - Rate limit (HOWL_TASK_RATE_LIMIT_SEC, default 300s).
+      - Hop limit (HOWL_MAX_CONSECUTIVE_HOPS, default 2): consecutive
+        delegations without a Nick interjection are rejected and Nick is DM'd.
     """
+    global _last_howl_task_ts, _consecutive_sophie_hops
+
     if not HOWL_CHANNEL_ID:
         return "error: howl_channel_id not configured"
+
+    now_t = time.time()
+    elapsed = now_t - _last_howl_task_ts
+    if _last_howl_task_ts > 0 and elapsed < HOWL_TASK_RATE_LIMIT_SEC:
+        wait = int(HOWL_TASK_RATE_LIMIT_SEC - elapsed)
+        log.info(f"post_to_howl rate-limited: {wait}s remaining")
+        return f"error: rate-limited, {wait}s until next sophie-task-howl allowed"
+
+    if _consecutive_sophie_hops >= HOWL_MAX_CONSECUTIVE_HOPS:
+        log.warning(
+            f"post_to_howl hop-limited: {_consecutive_sophie_hops} consecutive "
+            f"delegations without Nick interjection (max {HOWL_MAX_CONSECUTIVE_HOPS})"
+        )
+        # DM Nick so he can step in. Don't fire-and-forget; await so it lands.
+        try:
+            await send_dm(
+                f"⚠️ **Sophie→Howl hop limit hit.** Sophie tried to delegate "
+                f"{_consecutive_sophie_hops + 1} consecutive tasks to Howl with "
+                f"no input from you. Pausing further delegations until you reply. "
+                f"Last task attempted: {content[:200]}"
+            )
+        except Exception:
+            log.exception("failed to send hop-limit DM")
+        return (
+            f"error: hop-limited, {_consecutive_sophie_hops} consecutive "
+            f"delegations without Nick. Nick DM'd; wait for him to chime in."
+        )
+
     try:
         channel = client.get_channel(HOWL_CHANNEL_ID) or await client.fetch_channel(HOWL_CHANNEL_ID)
     except Exception as e:
@@ -357,6 +435,9 @@ async def post_to_howl(content: str) -> str:
             LAST_TASK_PATH.write_text(json.dumps({"last_task_utc": now_iso()}))
         except Exception:
             log.exception("failed to write last-task.json")
+        _last_howl_task_ts = now_t
+        _consecutive_sophie_hops += 1
+        log.info(f"post_to_howl ok: hops={_consecutive_sophie_hops}")
         return f"ok:{sent_messages[-1].id}"
     except Exception as e:
         log.exception("post_to_howl failed")
@@ -602,7 +683,12 @@ async def fire_schedule(s: dict):
         elif s["kind"] == "invoke":
             prompt = s.get("prompt", "")
             session_id = s.get("session_id") or str(uuid.uuid4())
-            reply = await run_sophie(session_id, True, prompt)
+            # Autonomy invokes (pause_when_off=True) get SOPHIE_AUTONOMY=1 in
+            # the child env so tools can refuse risky actions during unattended
+            # ticks. Explicit reminders (pause_when_off=False) run unguarded —
+            # Nick set them, he meant them.
+            autonomy_mode = bool(s.get("pause_when_off"))
+            reply = await run_sophie(session_id, True, prompt, autonomy_mode=autonomy_mode)
             log.info(f"schedule {sid[:8]} invoke stdout: {reply[:200]}")
             # Sophie messages Nick herself via sophie-notify; only surface failures.
             if reply.startswith(("[sophie error", "[sophie timed out", "[bot error")):
@@ -1066,6 +1152,11 @@ def strip_bot_mention(content: str) -> str:
 
 @client.event
 async def on_message(message: discord.Message):
+    # Both the #howl branch and the Nick-channel branch may reset this; declare
+    # at function scope so Python doesn't get confused (multiple `global` decls
+    # in one function are a syntax error).
+    global _consecutive_sophie_hops
+
     # Capture #howl traffic for sophie-recent-howl regardless of author —
     # Sophie's bot is in the server with message_content intent so she sees
     # everything posted there. Skip her own outbound (already in
@@ -1087,6 +1178,11 @@ async def on_message(message: discord.Message):
             })
         except Exception:
             log.exception("on_message: failed to log howl traffic")
+        # Reset the Sophie→Howl hop counter when Nick himself speaks in #howl.
+        if message.author.id == ALLOWED_USER_ID:
+            if _consecutive_sophie_hops:
+                log.info(f"hop counter reset by Nick in #howl (was {_consecutive_sophie_hops})")
+            _consecutive_sophie_hops = 0
         # Fall through — Nick mentioning Sophie in #howl still hits her
         # normal handler below.
 
@@ -1107,6 +1203,12 @@ async def on_message(message: discord.Message):
         "author_id": int(message.author.id),
         "content": content,
     })
+
+    # Nick speaking to Sophie clears the Sophie→Howl hop counter — he's
+    # actively in the loop, so further delegations are intentional.
+    if _consecutive_sophie_hops:
+        log.info(f"hop counter reset by Nick in Sophie channel (was {_consecutive_sophie_hops})")
+    _consecutive_sophie_hops = 0
 
     # --- Commands ---
     if content == "!new":
