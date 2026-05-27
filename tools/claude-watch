@@ -8,10 +8,14 @@ Usage:
 """
 import argparse
 import json
+import os
 import socket
 import sys
 
 SOCKET = "/run/claude-discord.sock"
+# Set by the bot when it launches Claude for a channel. Lets a fired watch
+# resume that channel's session instead of just DMing the user.
+CHANNEL_ID = os.environ.get("CLAUDE_CHANNEL_ID", "")
 
 def send(payload: dict) -> str:
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -50,6 +54,7 @@ try:
             "every": args.every,
             "timeout": args.timeout,
             "description": args.description or args.command[:60],
+            "channel_id": CHANNEL_ID,
         })
         if resp.startswith("ok:"):
             wid = resp.split(":", 1)[1]

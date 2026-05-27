@@ -23,6 +23,7 @@ DOCKER_ARGS=(
   -v "$CLAUDE_HOST/claude-watch:/usr/local/bin/claude-watch:ro"
   -v "$PROJECTS:/workspace"
   --env-file "$CLAUDE_HOST/.env"
+  -e CLAUDE_CHANNEL_ID
   -w /workspace
   claude-sandbox:latest
 )

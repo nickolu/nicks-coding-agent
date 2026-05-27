@@ -22,6 +22,7 @@ This README is the **file-to-host-path map** for actually deploying or restoring
 | `launcher/claude-sandbox` | `/usr/local/bin/claude-sandbox` (chmod +x) |
 | `sandbox/Dockerfile` | `/home/claude/sandbox/Dockerfile` — build with `docker build -t claude-sandbox:latest .` |
 | `claude-config/settings.json` | `/home/claude/.claude-container/settings.json` (bind-mounted into the container as `/home/claude/.claude/settings.json`) |
+| `claude-config/CLAUDE.md` | `/home/claude/projects/CLAUDE.md` (Howl's workspace instructions / advisor pattern, read as `/workspace/CLAUDE.md`) |
 | `claude-config/tripwire.sh` | `/home/claude/.claude-container/tripwire.sh` (chmod +x, bind-mounted as `/home/claude/.claude/tripwire.sh`) |
 | `claude-config/.env.example` | `/home/claude/.claude-container/.env` (fill in real values, mode `0600`) |
 | `claude-config/agents/*.md` | `/home/claude/.claude-container/agents/*.md` (bind-mounted into the container) |
@@ -199,6 +200,7 @@ scp droplet:/home/claude/sandbox/Dockerfile sandbox/Dockerfile
 scp 'droplet:/home/claude/.claude-container/agents/*.md' claude-config/agents/
 scp droplet:/home/claude/.claude-container/{claude-notify,claude-watch} tools/
 scp droplet:/home/claude/.claude-container/{tripwire.sh,settings.json} claude-config/
+scp droplet:/home/claude/projects/CLAUDE.md claude-config/CLAUDE.md
 ssh droplet 'cat /etc/systemd/system/claude-discord.service' > systemd/claude-discord.service
 
 # Sophie

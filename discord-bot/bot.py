@@ -82,12 +82,20 @@ def new_session(channel_id: str) -> str:
     return STATE[channel_id]["session_id"]
 
 
-async def run_claude(session_id: str, first_call: bool, prompt: str) -> str:
-    """Run claude-sandbox -p in a thread (blocking subprocess) and return stdout."""
+async def run_claude(session_id: str, first_call: bool, prompt: str, channel_id: str | None = None) -> str:
+    """Run claude-sandbox -p in a thread (blocking subprocess) and return stdout.
+
+    When channel_id is set, it's exported as CLAUDE_CHANNEL_ID into the container so
+    tools like claude-watch can tell the bot which session to resume when they fire.
+    """
     if first_call:
         args = [CLAUDE_CMD, "-p", "--session-id", session_id, prompt]
     else:
         args = [CLAUDE_CMD, "-p", "-r", session_id, prompt]
+
+    env = os.environ.copy()
+    if channel_id:
+        env["CLAUDE_CHANNEL_ID"] = channel_id
 
     def _run():
         try:
@@ -96,6 +104,7 @@ async def run_claude(session_id: str, first_call: bool, prompt: str) -> str:
                 capture_output=True,
                 text=True,
                 timeout=CLAUDE_TIMEOUT,
+                env=env,
             )
             if r.returncode != 0:
                 return f"[claude error rc={r.returncode}]\n{r.stderr.strip() or r.stdout.strip()}"
@@ -159,6 +168,59 @@ async def send_dm(msg: str):
         await user.send(chunk)
 
 
+async def post_to_channel(channel_id: str, msg: str):
+    """Post to a Discord channel by ID, falling back to a DM to the user."""
+    channel = None
+    try:
+        cid = int(channel_id)
+        channel = client.get_channel(cid) or await client.fetch_channel(cid)
+    except Exception:
+        channel = None
+    if channel is None:
+        await send_dm(msg)
+        return
+    for chunk in split_discord(msg):
+        await channel.send(chunk)
+
+
+async def wake_howl(watcher_id: str, info: dict, output: str):
+    """A watcher fired — resume Howl's session so he continues the blocked work.
+
+    Posts back to the channel the watch was created from. Re-uses that channel's
+    session (and its lock) so the wake doesn't interleave with a live conversation.
+    """
+    channel_id = info["channel_id"]
+    notify_msg = info.get("notify", "")
+    description = info.get("description", "")
+    wake_prompt = (
+        f"[Watcher fired — `{watcher_id[:8]}`] The condition you set a watch for is now met.\n"
+        f"Watch: {description}\n"
+        f"Command: {info['command']}\n"
+        f"Matched marker: {info['match']!r}\n"
+        f"Your note when you set it up: {notify_msg}\n\n"
+        f"Latest command output:\n{output[:3000]}\n\n"
+        "Take the next step this watch was blocking — e.g. if checks passed, proceed; "
+        "if they failed, diagnose, fix, and re-arm a watch. If this thread of work is done, "
+        "pick up or invent the next task per your workspace instructions. Report what you did."
+    )
+    await post_to_channel(
+        channel_id,
+        f"\U0001f440 **Watcher `{watcher_id[:8]}` fired** — waking Howl to continue.\n{notify_msg}",
+    )
+    lock = LOCKS.setdefault(channel_id, asyncio.Lock())
+    async with lock:
+        session_id, first_call = get_or_create_session(channel_id)
+        try:
+            reply = await run_claude(session_id, first_call, wake_prompt, channel_id=channel_id)
+        except Exception as e:
+            log.exception(f"watcher {watcher_id[:8]} wake failed")
+            await post_to_channel(channel_id, f"⚠️ Watcher `{watcher_id[:8]}` wake failed: {e}")
+            return
+        if first_call:
+            mark_session_used(channel_id)
+    await post_to_channel(channel_id, reply)
+
+
 async def watcher_loop(watcher_id: str, info: dict):
     """Poll a command at an interval until match or timeout."""
     command = info["command"]
@@ -167,6 +229,7 @@ async def watcher_loop(watcher_id: str, info: dict):
     notify_msg = info["notify"]
     deadline = info["deadline"]
     description = info.get("description", command[:60])
+    channel_id = info.get("channel_id", "")
 
     log.info(f"watcher {watcher_id[:8]} started: every={every}s match={match!r} timeout={int((deadline - time.time()) / 60)}min cmd={command[:80]}")
     try:
@@ -174,8 +237,11 @@ async def watcher_loop(watcher_id: str, info: dict):
             output = await run_check_command(command)
             log.info(f"watcher {watcher_id[:8]} check: {output[:120]}")
             if match.lower() in output.lower():
-                await send_dm(f"\u2705 **Watcher triggered** (`{watcher_id[:8]}`)\n{notify_msg}")
-                log.info(f"watcher {watcher_id[:8]} matched, notifying")
+                log.info(f"watcher {watcher_id[:8]} matched")
+                if channel_id:
+                    await wake_howl(watcher_id, info, output)
+                else:
+                    await send_dm(f"\u2705 **Watcher triggered** (`{watcher_id[:8]}`)\n{notify_msg}")
                 return
             remaining = deadline - time.time()
             if remaining <= 0:
@@ -198,6 +264,9 @@ def start_watcher(payload: dict) -> str:
     every = max(10, int(payload.get("every", 60)))
     timeout_min = min(MAX_WATCHER_TIMEOUT, max(1, int(payload.get("timeout", DEFAULT_WATCHER_TIMEOUT))))
     description = payload.get("description", command[:60])
+    # Channel the watch was created from (set via CLAUDE_CHANNEL_ID in the container).
+    # When present, a match resumes Howl's session there; otherwise it just DMs Nick.
+    channel_id = str(payload.get("channel_id", "") or "").strip()
 
     if not command or not match:
         return "error: watch requires 'command' and 'match' fields"
@@ -213,15 +282,17 @@ def start_watcher(payload: dict) -> str:
         "deadline": deadline,
         "timeout_min": timeout_min,
         "description": description,
+        "channel_id": channel_id,
         "created": time.time(),
     }
     task = asyncio.create_task(watcher_loop(watcher_id, info))
     WATCHERS[watcher_id] = {"task": task, "info": info}
 
+    fires_action = "wakes Howl to continue" if channel_id else "DMs you"
     asyncio.create_task(send_dm(
         f"\U0001f440 **Watcher started** (`{watcher_id[:8]}`)\n"
         f"{description}\n"
-        f"Checking every {every}s, expires in {timeout_min}min."
+        f"Checking every {every}s, expires in {timeout_min}min. On match: {fires_action}."
     ))
 
     return f"ok:{watcher_id}"
@@ -295,6 +366,7 @@ Execute ONE cycle of this priority loop:
 
 Rules:
 - Only do ONE major unit of work per cycle (one PR fix, one feature, one brainstorm+start). Don't try to do everything.
+- Don't idle when blocked. If you're waiting on CI/review, set a `claude-watch` for the blocker and advance other work (next issue, or invent one). Only emit `STATUS: IDLE` when there is genuinely nothing you can move forward.
 - Use `claude-notify` for meaningful status updates.
 - After creating a PR, set up `claude-watch` to monitor CI status.
 - Do not merge PRs without CI passing.
@@ -829,7 +901,7 @@ async def on_message(message: discord.Message):
             pass
         try:
             async with message.channel.typing():
-                reply = await run_claude(session_id, first_call, prompt)
+                reply = await run_claude(session_id, first_call, prompt, channel_id=channel_id)
         finally:
             try:
                 await message.remove_reaction("\u23f3", client.user)

@@ -60,6 +60,7 @@ install_file sandbox/Dockerfile                       /home/claude/sandbox/Docke
 # Claude config — bind-mounted into the per-invocation container
 install_file claude-config/settings.json              /home/claude/.claude-container/settings.json        claude claude 0644
 install_file claude-config/tripwire.sh                /home/claude/.claude-container/tripwire.sh          claude claude 0755
+install_file claude-config/CLAUDE.md                  /home/claude/projects/CLAUDE.md                     claude claude 0644
 install_dir_contents claude-config/agents             /home/claude/.claude-container/agents               claude claude 0644
 
 # Notify CLIs — bind-mounted into the container
