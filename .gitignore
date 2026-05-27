@@ -5,6 +5,9 @@ claude-config/.credentials.json
 sophie-bot/config.json
 sophie-config/.env
 sophie-config/.credentials.json
+calcifer-bot/config.json
+calcifer-config/.env
+calcifer-config/.credentials.json
 
 # Runtime / state directories on the host (never copied here, but listed for clarity)
 **/sessions/

@@ -1,0 +1,23 @@
+[Unit]
+Description=Calcifer Discord bridge (D&D DM assistant)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/calcifer-discord/venv/bin/python /opt/calcifer-discord/bot.py
+Restart=on-failure
+RestartSec=5
+# Runs as root because calcifer-sandbox uses docker (docker group == root)
+User=root
+StandardOutput=journal
+StandardError=journal
+# Basic hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/var/lib/calcifer-discord /home/calcifer/.claude-container /run
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

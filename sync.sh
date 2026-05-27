@@ -94,12 +94,35 @@ else
   echo "(skipping sophie-* install table: sophie user does not exist)"
 fi
 
+# === Calcifer (D&D dungeon-master assistant) ===
+# Only installed if the calcifer OS user exists. Same pattern as Sophie —
+# keeps Howl-only / Sophie-only droplets clean.
+if id calcifer >/dev/null 2>&1; then
+  install_file calcifer-bot/bot.py                      /opt/calcifer-discord/bot.py                          root     root     0755
+  install_file calcifer-launcher/calcifer-sandbox       /usr/local/bin/calcifer-sandbox                       root     root     0755
+  install_file calcifer-sandbox/Dockerfile              /home/calcifer/sandbox/Dockerfile                     calcifer calcifer 0644
+  install_file calcifer-config/settings.json            /home/calcifer/.claude-container/settings.json        calcifer calcifer 0644
+  install_file calcifer-config/tripwire.sh              /home/calcifer/.claude-container/tripwire.sh          calcifer calcifer 0755
+  install_file calcifer-config/CLAUDE.md                /home/calcifer/notebook/CLAUDE.md                     calcifer calcifer 0644
+  install_file calcifer-tools/calcifer-notify           /home/calcifer/.claude-container/calcifer-notify      calcifer calcifer 0755
+  install_file calcifer-tools/calcifer-watch            /home/calcifer/.claude-container/calcifer-watch       calcifer calcifer 0755
+  install_file calcifer-tools/calcifer-image            /home/calcifer/.claude-container/calcifer-image       calcifer calcifer 0755
+  install_file calcifer-tools/calcifer-attach           /home/calcifer/.claude-container/calcifer-attach      calcifer calcifer 0755
+  install_file calcifer-tools/calcifer-schedule         /home/calcifer/.claude-container/calcifer-schedule    calcifer calcifer 0755
+  install_file calcifer-tools/calcifer-recent-dms       /home/calcifer/.claude-container/calcifer-recent-dms  calcifer calcifer 0755
+  install_file calcifer-systemd/calcifer-discord.service /etc/systemd/system/calcifer-discord.service         root     root     0644
+else
+  echo "(skipping calcifer-* install table: calcifer user does not exist)"
+fi
+
 # --- decide what to restart ---
 restart_bot=0
 restart_sophie=0
+restart_calcifer=0
 reload_systemd=0
 warn_dockerfile=0
 warn_sophie_dockerfile=0
+warn_calcifer_dockerfile=0
 for path in "${CHANGED[@]:-}"; do
   case "$path" in
     /opt/claude-discord/bot.py)                     restart_bot=1 ;;
@@ -108,6 +131,9 @@ for path in "${CHANGED[@]:-}"; do
     /opt/sophie-discord/bot.py)                     restart_sophie=1 ;;
     /etc/systemd/system/sophie-discord.service)     reload_systemd=1; restart_sophie=1 ;;
     /home/sophie/sandbox/Dockerfile)                warn_sophie_dockerfile=1 ;;
+    /opt/calcifer-discord/bot.py)                   restart_calcifer=1 ;;
+    /etc/systemd/system/calcifer-discord.service)   reload_systemd=1; restart_calcifer=1 ;;
+    /home/calcifer/sandbox/Dockerfile)              warn_calcifer_dockerfile=1 ;;
   esac
 done
 
@@ -123,11 +149,13 @@ echo
 
 if (( DRY_RUN )); then
   echo "(dry-run; no actions taken)"
-  (( reload_systemd ))        && echo "would: systemctl daemon-reload"
-  (( restart_bot ))           && echo "would: systemctl restart claude-discord"
-  (( restart_sophie ))        && echo "would: systemctl restart sophie-discord"
-  (( warn_dockerfile ))       && echo "note: Howl Dockerfile changed — rebuild with: docker build -t claude-sandbox:latest /home/claude/sandbox"
-  (( warn_sophie_dockerfile ))&& echo "note: Sophie Dockerfile changed — rebuild with: docker build -t sophie-sandbox:latest /home/sophie/sandbox"
+  (( reload_systemd ))           && echo "would: systemctl daemon-reload"
+  (( restart_bot ))              && echo "would: systemctl restart claude-discord"
+  (( restart_sophie ))           && echo "would: systemctl restart sophie-discord"
+  (( restart_calcifer ))         && echo "would: systemctl restart calcifer-discord"
+  (( warn_dockerfile ))          && echo "note: Howl Dockerfile changed — rebuild with: docker build -t claude-sandbox:latest /home/claude/sandbox"
+  (( warn_sophie_dockerfile ))   && echo "note: Sophie Dockerfile changed — rebuild with: docker build -t sophie-sandbox:latest /home/sophie/sandbox"
+  (( warn_calcifer_dockerfile )) && echo "note: Calcifer Dockerfile changed — rebuild with: docker build -t calcifer-sandbox:latest /home/calcifer/sandbox"
   exit 0
 fi
 
@@ -145,6 +173,11 @@ if (( restart_sophie )); then
   systemctl restart sophie-discord
   systemctl --no-pager status sophie-discord | head -15
 fi
+if (( restart_calcifer )); then
+  echo "+ systemctl restart calcifer-discord"
+  systemctl restart calcifer-discord
+  systemctl --no-pager status calcifer-discord | head -15
+fi
 if (( warn_dockerfile )); then
   echo
   echo "Howl Dockerfile changed. Rebuild the sandbox image when ready:"
@@ -154,4 +187,9 @@ if (( warn_sophie_dockerfile )); then
   echo
   echo "Sophie Dockerfile changed. Rebuild the sandbox image when ready:"
   echo "    docker build -t sophie-sandbox:latest /home/sophie/sandbox"
+fi
+if (( warn_calcifer_dockerfile )); then
+  echo
+  echo "Calcifer Dockerfile changed. Rebuild the sandbox image when ready:"
+  echo "    docker build -t calcifer-sandbox:latest /home/calcifer/sandbox"
 fi

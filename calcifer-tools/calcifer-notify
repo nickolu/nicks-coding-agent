@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Send a notification via Calcifer's Discord bridge socket.
+
+Usage:
+  calcifer-notify "message"
+  echo "message" | calcifer-notify
+  calcifer-notify --track session-prep --reactions "🔥,⏭️" "session prep ready?"
+
+Flags:
+  --track <tag>          Tag this message so reactions on it group under <tag>.
+  --reactions e1,e2,...  Pre-attach reaction emojis so Nick can tap to ack
+                         without typing. Defaults to "✅,⏭️" when --track is set.
+"""
+import argparse
+import json
+import socket
+import sys
+
+SOCKET = "/run/calcifer-discord.sock"
+DEFAULT_REACTIONS = ["✅", "⏭️"]
+
+
+def send(payload_or_text) -> None:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(SOCKET)
+    if isinstance(payload_or_text, dict):
+        s.sendall(json.dumps(payload_or_text).encode("utf-8"))
+    else:
+        s.sendall(payload_or_text.encode("utf-8"))
+    s.shutdown(socket.SHUT_WR)
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+    s.close()
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--track", default="", help="Tag for grouping reactions.")
+    p.add_argument("--reactions", default="",
+                   help='Comma-separated emojis (default "✅,⏭️" when --track set).')
+    p.add_argument("message", nargs="*", help="Message text. Falls back to stdin if omitted.")
+    args = p.parse_args()
+
+    msg = " ".join(args.message).strip() if args.message else sys.stdin.read().strip()
+    if not msg:
+        return 0
+
+    tag = args.track.strip()
+    reactions: list[str] = []
+    if args.reactions:
+        reactions = [e.strip() for e in args.reactions.split(",") if e.strip()]
+    elif tag:
+        reactions = list(DEFAULT_REACTIONS)
+
+    try:
+        if tag or reactions:
+            send({"type": "notify", "message": msg, "track": tag, "reactions": reactions})
+        else:
+            send(msg)
+    except FileNotFoundError:
+        print(f"calcifer-notify: socket {SOCKET} not found", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"calcifer-notify: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

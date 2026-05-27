@@ -7,6 +7,7 @@ that runs on a DigitalOcean droplet and is driven from Discord.
 |---|---|---|
 | **Howl** | Engineer / coding agent. Writes code, opens PRs, monitors CI. | Discord (DM the Howl bot, or `#howl` channel) |
 | **Sophie** | Chief of staff / personal manager. Goals, journal, reminders, Google Tasks/Calendar/Gmail. | Discord (DM the Sophie bot, or `#sophie` channel) |
+| **Calcifer** | D&D dungeon-master assistant. Encounters, NPCs, session recaps, art. | Discord (DM the Calcifer bot, or `#calcifer` channel) |
 
 The "what Howl does and why" lives in [`claud-droplet-agent.md`](./claud-droplet-agent.md).
 This README is the **file-to-host-path map** for actually deploying or restoring both agents.
@@ -47,6 +48,20 @@ This README is the **file-to-host-path map** for actually deploying or restoring
 | `sophie-tools/sophie-image`, `sophie-attach`, `sophie-schedule`, `sophie-recent-dms`, `sophie-recent-howl`, `sophie-task-howl`, `sophie-await-howl-reply` | `/home/sophie/.claude-container/<name>` (chmod +x) |
 | `sophie-systemd/sophie-discord.service` | `/etc/systemd/system/sophie-discord.service` |
 
+### Calcifer
+
+| Repo path | Host path on the droplet |
+|---|---|
+| `calcifer-bot/bot.py` | `/opt/calcifer-discord/bot.py` |
+| `calcifer-bot/config.json.example` | `/etc/calcifer-discord/config.json` (fill in real values, mode `0600`) |
+| `calcifer-launcher/calcifer-sandbox` | `/usr/local/bin/calcifer-sandbox` (chmod +x) |
+| `calcifer-sandbox/Dockerfile` | `/home/calcifer/sandbox/Dockerfile` — build with `docker build -t calcifer-sandbox:latest .` |
+| `calcifer-config/settings.json` | `/home/calcifer/.claude-container/settings.json` (bind-mounted as `/home/calcifer/.claude/settings.json`) |
+| `calcifer-config/tripwire.sh` | `/home/calcifer/.claude-container/tripwire.sh` (bind-mounted as `/home/calcifer/.claude/tripwire.sh`) |
+| `calcifer-config/CLAUDE.md` | `/home/calcifer/notebook/CLAUDE.md` (Calcifer's persona) |
+| `calcifer-tools/calcifer-notify`, `calcifer-watch`, `calcifer-image`, `calcifer-attach`, `calcifer-schedule`, `calcifer-recent-dms` | `/home/calcifer/.claude-container/<name>` (chmod +x) |
+| `calcifer-systemd/calcifer-discord.service` | `/etc/systemd/system/calcifer-discord.service` |
+
 ## What is **not** in this repo
 
 These live only on the host because they are secrets or runtime state:
@@ -65,6 +80,14 @@ These live only on the host because they are secrets or runtime state:
 - `/home/sophie/notebook/journal/` — daily entries
 - per-session state in `/home/sophie/.claude-container/{sessions,projects,cache,plans,…}/`
 - `/var/lib/sophie-discord/sessions.json`
+
+**Calcifer:**
+- `/etc/calcifer-discord/config.json` — Discord bot token + allowed user ID + (optional) channel ID
+- `/home/calcifer/.claude-container/.credentials.json` — Claude login credentials
+- `/home/calcifer/notebook/dnd/` — campaign notes (per-campaign subfolders)
+- `/home/calcifer/notebook/generated-images/` — image output (NPC portraits, locations)
+- per-session state in `/home/calcifer/.claude-container/{sessions,projects,cache,plans,…}/`
+- `/var/lib/calcifer-discord/sessions.json`
 
 ## One-time setup for Sophie
 
@@ -160,6 +183,87 @@ script (`sync.sh`) is **idempotent** and only installs Sophie's files if the
     ```
     Then DM Sophie or post in `#sophie` — she should reply.
 
+## One-time setup for Calcifer
+
+Same shape as Sophie's setup. `sync.sh` skips Calcifer files entirely until the
+`calcifer` user exists, so this is safe to run on a Howl-only / Howl+Sophie droplet.
+
+1. **Discord — create the bot.**
+   - In **Pendragon & Co**, create a `#calcifer` channel.
+   - At <https://discord.com/developers/applications>, create a new application **Calcifer**, add a Bot, enable **Message Content Intent**, copy the bot token.
+   - Invite the bot to the server with permissions in `#calcifer` only.
+   - Right-click `#calcifer` (with Developer Mode on) → Copy ID.
+
+2. **Droplet — create the `calcifer` user and dirs.**
+   ```sh
+   sudo groupadd -g 1002 calcifer
+   sudo useradd -m -u 1002 -g 1002 -G docker -s /bin/bash calcifer
+   sudo install -d -o calcifer -g calcifer -m 0755 \
+       /home/calcifer/notebook \
+       /home/calcifer/notebook/dnd \
+       /home/calcifer/notebook/generated-images \
+       /home/calcifer/.claude-container \
+       /home/calcifer/sandbox \
+       /opt/calcifer-discord \
+       /etc/calcifer-discord \
+       /var/lib/calcifer-discord
+   sudo chown root:root /etc/calcifer-discord /opt/calcifer-discord /var/lib/calcifer-discord
+   ```
+
+3. **Deploy the files.**
+   ```sh
+   cd /opt/claude-bridge
+   sudo git pull
+   sudo ./sync.sh
+   ```
+
+4. **Bot config.**
+   ```sh
+   sudo cp /opt/claude-bridge/calcifer-bot/config.json.example /etc/calcifer-discord/config.json
+   sudo nano /etc/calcifer-discord/config.json   # fill bot_token, allowed_user_id, allowed_channel_id
+   sudo chmod 0600 /etc/calcifer-discord/config.json
+   ```
+
+5. **Bot Python venv.**
+   ```sh
+   sudo python3 -m venv /opt/calcifer-discord/venv
+   sudo /opt/calcifer-discord/venv/bin/pip install discord.py
+   ```
+
+6. **Build Calcifer's Docker image.**
+   ```sh
+   sudo docker build -t calcifer-sandbox:latest /home/calcifer/sandbox
+   ```
+
+7. **Add API keys for image gen.**
+   Put `OPENAI_API_KEY=...` and `GOOGLE_API_KEY=...` in `/home/calcifer/.claude-container/.env`
+   (mode `0600`). The same keys Sophie uses are fine; Calcifer has his own copy of
+   `.env` so each agent's secrets are isolated.
+
+8. **`claude login` inside Calcifer's container** (one-time, interactive).
+   ```sh
+   sudo -u calcifer /usr/local/bin/calcifer-sandbox shell
+   # inside the container:
+   claude login        # paste URL into your browser, approve
+   exit
+   ```
+
+9. **(Optional) Migrate existing campaign notes.**
+   ```sh
+   # on the laptop, if you have D&D notes already:
+   rsync -av ~/dnd-notes/ droplet:/tmp/dnd/
+   # on the droplet:
+   sudo rsync -av --chown=calcifer:calcifer /tmp/dnd/ /home/calcifer/notebook/dnd/
+   sudo rm -rf /tmp/dnd
+   ```
+
+10. **Start the bot.**
+    ```sh
+    sudo systemctl enable --now calcifer-discord
+    sudo systemctl status calcifer-discord
+    ```
+    Then DM Calcifer or post in `#calcifer` — he should reply.
+
 ## Deploy workflow (steady state)
 
 The droplet has a clone of this repo at `/opt/claude-bridge`. To ship a change:
@@ -212,4 +316,13 @@ scp droplet:/home/sophie/.claude-container/{tripwire.sh,settings.json} sophie-co
 scp droplet:/home/sophie/notebook/CLAUDE.md sophie-config/CLAUDE.md
 scp droplet:/home/sophie/.claude-container/{sophie-notify,sophie-watch} sophie-tools/
 ssh droplet 'cat /etc/systemd/system/sophie-discord.service' > sophie-systemd/sophie-discord.service
+
+# Calcifer
+scp droplet:/opt/calcifer-discord/bot.py calcifer-bot/bot.py
+scp droplet:/usr/local/bin/calcifer-sandbox calcifer-launcher/calcifer-sandbox
+scp droplet:/home/calcifer/sandbox/Dockerfile calcifer-sandbox/Dockerfile
+scp droplet:/home/calcifer/.claude-container/{tripwire.sh,settings.json} calcifer-config/
+scp droplet:/home/calcifer/notebook/CLAUDE.md calcifer-config/CLAUDE.md
+scp 'droplet:/home/calcifer/.claude-container/calcifer-*' calcifer-tools/
+ssh droplet 'cat /etc/systemd/system/calcifer-discord.service' > calcifer-systemd/calcifer-discord.service
 ```

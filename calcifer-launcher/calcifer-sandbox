@@ -1,0 +1,41 @@
+#!/bin/bash
+set -e
+CALCIFER_HOST=/home/calcifer/.claude-container
+NOTEBOOK=/home/calcifer/notebook
+
+if [ ! -s "$CALCIFER_HOST/claude.json" ]; then
+  echo '{}' > "$CALCIFER_HOST/claude.json"
+  chown calcifer:calcifer "$CALCIFER_HOST/claude.json"
+  chmod 600 "$CALCIFER_HOST/claude.json"
+fi
+
+TTY_FLAGS=()
+if [ -t 0 ] && [ -t 1 ]; then TTY_FLAGS=(-it); fi
+
+DOCKER_ARGS=(
+  --rm "${TTY_FLAGS[@]}"
+  --name "calcifer-sandbox-$$"
+  --hostname calcifer-sandbox
+  -e "TZ=${TZ:-UTC}"
+  -e "CALCIFER_AUTONOMY=${CALCIFER_AUTONOMY:-}"
+  -v "$CALCIFER_HOST:/home/calcifer/.claude"
+  -v "$CALCIFER_HOST/claude.json:/home/calcifer/.claude.json"
+  -v "/run/calcifer-discord.sock:/run/calcifer-discord.sock"
+  -v "/var/lib/calcifer-discord:/var/lib/calcifer-discord:ro"
+  -v "$CALCIFER_HOST/calcifer-notify:/usr/local/bin/calcifer-notify:ro"
+  -v "$CALCIFER_HOST/calcifer-watch:/usr/local/bin/calcifer-watch:ro"
+  -v "$CALCIFER_HOST/calcifer-image:/usr/local/bin/calcifer-image:ro"
+  -v "$CALCIFER_HOST/calcifer-attach:/usr/local/bin/calcifer-attach:ro"
+  -v "$CALCIFER_HOST/calcifer-schedule:/usr/local/bin/calcifer-schedule:ro"
+  -v "$CALCIFER_HOST/calcifer-recent-dms:/usr/local/bin/calcifer-recent-dms:ro"
+  -v "$NOTEBOOK:/notebook"
+  --env-file "$CALCIFER_HOST/.env"
+  -w /notebook
+  calcifer-sandbox:latest
+)
+
+case "$1" in
+  shell) exec docker run "${DOCKER_ARGS[@]}" bash ;;
+  -p)    shift; exec docker run "${DOCKER_ARGS[@]}" claude --dangerously-skip-permissions -p "$@" ;;
+  *)     exec docker run "${DOCKER_ARGS[@]}" claude --dangerously-skip-permissions "$@" ;;
+esac

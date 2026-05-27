@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Schedule a reminder or autonomous wakeup via Calcifer's bridge socket.
+
+Two flavors:
+  notify  — bot DMs `--message` at fire time. No Calcifer thinking required.
+  invoke  — bot wakes Calcifer with `--prompt`; Calcifer decides what to say/do.
+
+Time:
+  --at "2026-05-06T19:00"           ISO 8601 (naive => user's local TZ)
+  --in 30m | --in 2h | --in 1d      relative to now
+Recurrence:
+  --recurring daily | weekly | every:30m | every:2h | every:1d
+
+Examples:
+  # Thursday session reminder
+  calcifer-schedule --at "2026-05-14T17:00" --message "weekday session in 2h — prep ready?"
+
+  # Weekly between-session prep tick (autonomous)
+  calcifer-schedule --at "2026-05-13T20:00" --recurring weekly \\
+                    --invoke --prompt "Review weekday campaign open threads. Surface what needs prep before Thursday." \\
+                    --autonomy
+
+  # Tracked nudge with tap-to-ack
+  calcifer-schedule --at "2026-05-14T17:00" --recurring weekly \\
+                    --message "session prep ready?" --track session-prep --reactions "🔥,⏭️"
+
+  # Manage
+  calcifer-schedule --list
+  calcifer-schedule --cancel <id-prefix>
+"""
+import argparse
+import json
+import re
+import socket
+import sys
+from datetime import datetime, timedelta
+
+SOCKET = "/run/calcifer-discord.sock"
+
+
+def send(payload: dict) -> str:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(SOCKET)
+    s.sendall(json.dumps(payload).encode("utf-8"))
+    s.shutdown(socket.SHUT_WR)
+    chunks = []
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    s.close()
+    return b"".join(chunks).decode("utf-8", errors="replace").strip()
+
+
+def parse_in(spec: str) -> str:
+    m = re.fullmatch(r"(\d+)\s*([mhd])", spec.strip())
+    if not m:
+        raise SystemExit(f"--in: expected like '30m', '2h', '1d' (got {spec!r})")
+    n, unit = int(m.group(1)), m.group(2)
+    delta = {"m": timedelta(minutes=n), "h": timedelta(hours=n), "d": timedelta(days=n)}[unit]
+    return (datetime.now().astimezone() + delta).isoformat()
+
+
+p = argparse.ArgumentParser(
+    description="Schedule reminders / autonomous wakeups for Calcifer",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=__doc__,
+)
+g_when = p.add_mutually_exclusive_group()
+g_when.add_argument("--at", help="ISO 8601 fire time; naive => user TZ")
+g_when.add_argument("--in", dest="in_", help="Relative offset, e.g. 30m / 2h / 1d")
+
+g_kind = p.add_mutually_exclusive_group()
+g_kind.add_argument("--message", help="DM string for kind=notify")
+g_kind.add_argument("--prompt", help="Wakeup prompt for kind=invoke")
+
+p.add_argument("--invoke", action="store_true", help="Force kind=invoke")
+p.add_argument("--recurring", help="daily | weekly | every:Nm|Nh|Nd")
+p.add_argument("--session-id", help="Reuse a session for recurring invokes (default: fresh)")
+p.add_argument("--autonomy", action="store_true",
+               help="Mark as autonomy tick — gated by !autonomy off and quiet hours")
+p.add_argument("--defer-if-quiet", action="store_true",
+               help="If fire time falls in quiet hours, push to the end of the window")
+p.add_argument("--track", default="", help="Tag for grouping reactions (notify only).")
+p.add_argument("--reactions", default="",
+               help="Comma-separated emojis to pre-attach (defaults to '✅,⏭️' when --track set).")
+p.add_argument("--description", default="", help="Short label shown in !schedules")
+p.add_argument("--list", action="store_true", help="List all scheduled tasks")
+p.add_argument("--cancel", metavar="ID", help="Cancel a schedule by ID prefix")
+args = p.parse_args()
+
+try:
+    if args.list:
+        print(send({"type": "schedule_list"}))
+        sys.exit(0)
+    if args.cancel:
+        print(send({"type": "schedule_cancel", "id": args.cancel}))
+        sys.exit(0)
+    if not (args.at or args.in_):
+        p.print_help()
+        sys.exit(1)
+    fire_at = args.at if args.at else parse_in(args.in_)
+    if args.prompt or args.invoke:
+        kind = "invoke"
+        if not args.prompt:
+            sys.exit("--invoke requires --prompt")
+    elif args.message:
+        kind = "notify"
+    else:
+        sys.exit("must specify --message (notify) or --prompt (invoke)")
+
+    track = args.track.strip()
+    if args.reactions:
+        reactions = [e.strip() for e in args.reactions.split(",") if e.strip()]
+    elif track:
+        reactions = ["✅", "⏭️"]
+    else:
+        reactions = []
+    if kind != "notify" and (track or reactions):
+        sys.exit("--track/--reactions are only valid with --message (notify)")
+
+    payload = {
+        "type": "schedule_add", "kind": kind, "fire_at": fire_at,
+        "message": args.message or "", "prompt": args.prompt or "",
+        "recurrence": args.recurring, "session_id": args.session_id,
+        "pause_when_off": bool(args.autonomy),
+        "defer_if_quiet": bool(args.defer_if_quiet),
+        "track": track, "reactions": reactions,
+        "description": args.description,
+    }
+    resp = send(payload)
+    if resp.startswith("ok:"):
+        sid = resp.split(":", 1)[1]
+        rec = f", recurring {args.recurring}" if args.recurring else ""
+        print(f"Scheduled {sid[:8]} ({kind}) for {fire_at}{rec}")
+    else:
+        print(resp, file=sys.stderr)
+        sys.exit(1)
+except FileNotFoundError:
+    print(f"calcifer-schedule: socket {SOCKET} not found (bot not running?)", file=sys.stderr)
+    sys.exit(1)
