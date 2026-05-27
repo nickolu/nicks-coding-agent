@@ -13,8 +13,12 @@ RUN mkdir -p -m 755 /etc/apt/keyrings \
  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
  && apt-get update && apt-get install -y --no-install-recommends gh && rm -rf /var/lib/apt/lists/*
 
-# Claude Code
-RUN npm install -g @anthropic-ai/claude-code
+# Claude Code + Vercel CLI
+# Vercel: deployment + project management. Auth via VERCEL_TOKEN env var in
+# /home/claude/.claude-container/.env (generate at https://vercel.com/account/tokens).
+# Avoid `vercel login` — its token cache lives outside the bind-mounted ~/.claude
+# and would be lost between container runs.
+RUN npm install -g @anthropic-ai/claude-code vercel
 
 # Playwright MCP server + Chromium browser (shared location for non-root user)
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
