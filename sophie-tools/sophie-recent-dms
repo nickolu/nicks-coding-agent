@@ -104,6 +104,10 @@ def main() -> int:
     p.add_argument("--tag", help="Filter outbound + reactions by tag (water, stand, ...)")
     p.add_argument("--include-outbound", action="store_true",
                    help="Include Sophie's own outbound messages (always on with --tag).")
+    p.add_argument("--include-reactions-on-untagged", action="store_true",
+                   help="When --tag is set, also surface reactions on untagged messages "
+                        "(e.g. taps on conversational replies). Without this flag, --tag "
+                        "filters reactions to the tag only.")
     p.add_argument("--format", choices=("text", "json"), default="text")
     args = p.parse_args()
 
@@ -125,11 +129,16 @@ def main() -> int:
     show_outbound = args.include_outbound or bool(args.tag)
     if args.tag:
         outbound = [r for r in outbound_all if r.get("tag") == args.tag]
-        # Reactions filter: by tag if recorded, else by message_id join with outbound
+        # Reactions filter: by tag if recorded, else by message_id join with outbound.
+        # --include-reactions-on-untagged additionally surfaces reactions whose tag
+        # is empty so Sophie doesn't miss taps on conversational replies when
+        # she's running a tag-scoped query.
         outbound_ids = {r["message_id"] for r in outbound_all if r.get("tag") == args.tag}
         reactions = [
             r for r in reactions_all
-            if r.get("tag") == args.tag or r.get("message_id") in outbound_ids
+            if r.get("tag") == args.tag
+            or r.get("message_id") in outbound_ids
+            or (args.include_reactions_on_untagged and not (r.get("tag") or ""))
         ]
     else:
         outbound = outbound_all if show_outbound else []

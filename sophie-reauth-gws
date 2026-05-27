@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+#
+# sophie-reauth-gws — re-authenticate Sophie's Google (gws) access, end to end.
+#
+# Run this ON YOUR MAC. It drives the headless OAuth flow for you:
+#   1. normalizes trailing whitespace in .env (a stray space on the OAuth
+#      client id/secret silently breaks the consent URL — the 2026-05-24 bug),
+#   2. starts a one-off `gws auth login` listener in Sophie's container on the
+#      droplet (--network host, so the loopback OAuth callback is reachable),
+#   3. opens the consent URL in your local browser (full URL — avoids the TUI
+#      Cmd-click truncation that mangles the request),
+#   4. takes the "http://localhost:<port>/?code=..." URL you paste back and
+#      delivers it to the waiting listener (the PKCE verifier lives in that
+#      process, so the code must go there),
+#   5. verifies the new token with a live Gmail read.
+#
+# Usage:
+#   ./sophie-reauth-gws                     # default scopes
+#   ./sophie-reauth-gws --scopes a,b,c      # custom comma-separated scopes
+#   DROPLET=otherhost ./sophie-reauth-gws   # ssh host alias (default: droplet)
+#
+set -euo pipefail
+
+DROPLET="${DROPLET:-droplet}"
+SH=/home/sophie/.claude-container
+IMAGE=sophie-sandbox:latest
+NAME=gwsauth
+SCOPES="https://www.googleapis.com/auth/gmail.modify,https://www.googleapis.com/auth/calendar,https://www.googleapis.com/auth/tasks,https://www.googleapis.com/auth/drive.file"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --scopes) SCOPES="$2"; shift 2 ;;
+    -h|--help) sed -n '3,26p' "$0"; exit 0 ;;
+    *) echo "sophie-reauth-gws: unknown arg '$1'" >&2; exit 2 ;;
+  esac
+done
+
+MOUNTS="-v $SH/gws-config:/home/sophie/.config/gws -v $SH/keyrings:/home/sophie/.local/share/keyrings --env-file $SH/.env"
+
+cleanup() { ssh "$DROPLET" "docker rm -f $NAME >/dev/null 2>&1 || true"; }
+trap cleanup EXIT
+
+echo "→ gws re-auth on '$DROPLET'"
+echo "  scopes: $SCOPES"
+
+# 1. Normalize trailing whitespace on .env values (latent auth-breaker).
+ssh "$DROPLET" "sed -i.bak -E 's/[[:space:]]+\$//' $SH/.env && echo '  .env whitespace normalized (backup .env.bak)'"
+
+# 2. Start the listener and capture the consent URL.
+ssh "$DROPLET" "docker rm -f $NAME >/dev/null 2>&1 || true; docker run -d --name $NAME --network host $MOUNTS $IMAGE bash -lc 'gws auth login --scopes $SCOPES' >/dev/null"
+
+echo -n "  waiting for consent URL"
+URL=""
+for _ in $(seq 1 15); do
+  URL=$(ssh "$DROPLET" "docker logs $NAME 2>&1 | grep -o 'https://accounts.google.com[^ ]*' | tail -1" || true)
+  [ -n "$URL" ] && break
+  echo -n "."; sleep 1
+done
+echo
+[ -z "$URL" ] && { echo "✗ never saw a consent URL. Debug: ssh $DROPLET docker logs $NAME" >&2; exit 1; }
+
+# 3. Open it locally — full URL, no TUI truncation.
+echo "→ opening consent URL in your browser"
+open "$URL" 2>/dev/null || { echo "  couldn't auto-open; paste this into a browser:"; echo "  $URL"; }
+
+cat <<'EOF'
+
+  In the browser:
+    - pick the Google account Sophie should use
+    - if "Google hasn't verified this app": Advanced -> "Go to ... (unsafe)"
+    - approve all the permissions
+    - you'll land on "This site can't be reached" at localhost:<port> -- that's success
+
+EOF
+
+# 4. Take the redirect URL and hand the code to the listener.
+printf "Paste the full localhost URL from the address bar, then Enter:\n> "
+read -r REDIRECT
+[ -z "${REDIRECT:-}" ] && { echo "✗ no URL pasted" >&2; exit 1; }
+
+echo "→ delivering code to listener"
+RESP=$(ssh "$DROPLET" "curl -s -m 25 '$REDIRECT'" || true)
+if echo "$RESP" | grep -qi success; then
+  echo "  listener: success"
+else
+  echo "  ✗ listener did not report success. Response: $RESP" >&2
+  echo "  (the code may have expired — just re-run this script)" >&2
+  exit 1
+fi
+
+# 5. Verify with a live read.
+echo "→ verifying new token"
+ssh "$DROPLET" "docker run --rm $MOUNTS $IMAGE bash -lc 'gws auth status 2>&1 | grep -e has_refresh_token -e scope_count; echo; gws gmail +triage --format table 2>&1 | head -4'"
+
+echo "✓ gws re-auth complete."

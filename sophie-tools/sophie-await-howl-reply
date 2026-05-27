@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Ask the bot to watch #howl for a reply to Sophie's last delegation.
+
+Fires and forgets — the bot polls in the background and DMs Nick when Howl
+replies (or when the deadline elapses with no reply). Sophie is NOT re-invoked
+per check, so there's no per-tick token cost.
+
+Typical flow:
+  sophie-task-howl "Please refactor X in repo Y…"
+  sophie-await-howl-reply --max-wait 30m --check-every 5m
+  # exit Sophie's session — Nick will get a DM when Howl responds.
+
+Flags:
+  --max-wait <spec>    How long to keep watching (e.g. 30m, 2h, 1d). Default 30m.
+  --check-every <spec> Poll interval (e.g. 30s, 5m). Default 5m.
+  --since <iso>        Start point for scanning #howl. Defaults to Sophie's
+                       last sophie-task-howl timestamp.
+  --label "..."        Optional short label included in the DM Nick gets.
+
+Bounds:
+  max-wait is clamped to [60s, 6h]
+  check-every is clamped to [30s, max-wait]
+
+Returns:
+  ok:<await-id>  on success (the await runs in the bot)
+  error: ...     on failure
+"""
+import argparse
+import json
+import re
+import socket
+import sys
+
+SOCKET = "/run/sophie-discord.sock"
+
+
+def parse_duration(spec: str) -> int:
+    """Parse '30s', '5m', '2h', '1d' to seconds."""
+    spec = spec.strip()
+    m = re.fullmatch(r"(\d+)\s*([smhd])", spec)
+    if not m:
+        raise SystemExit(f"bad duration {spec!r}: expected like 30s, 5m, 2h, 1d")
+    n, unit = int(m.group(1)), m.group(2)
+    return n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+
+
+def send(payload: dict) -> str:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(SOCKET)
+    s.sendall(json.dumps(payload).encode("utf-8"))
+    s.shutdown(socket.SHUT_WR)
+    chunks = []
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    s.close()
+    return b"".join(chunks).decode("utf-8", errors="replace").strip()
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--max-wait", default="30m", help="How long to keep watching (default 30m).")
+    p.add_argument("--check-every", default="5m", help="Poll interval (default 5m).")
+    p.add_argument("--since", default="", help="Start ISO 8601 (default: last sophie-task-howl ts).")
+    p.add_argument("--label", default="", help="Short label included in the resolution DM.")
+    args = p.parse_args()
+
+    payload = {
+        "type": "await_howl_reply",
+        "max_wait_sec": parse_duration(args.max_wait),
+        "check_every_sec": parse_duration(args.check_every),
+        "since_iso": args.since,
+        "label": args.label,
+    }
+
+    try:
+        resp = send(payload)
+    except FileNotFoundError:
+        print(f"sophie-await-howl-reply: socket {SOCKET} not found (bot not running?)", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"sophie-await-howl-reply: {e}", file=sys.stderr)
+        return 1
+
+    if resp.startswith("ok:"):
+        aid = resp.split(":", 1)[1]
+        print(f"Watching for Howl reply (await {aid[:8]}, max {args.max_wait}, every {args.check_every}).")
+        print("Nick will be DMed when Howl replies or when the deadline elapses.")
+        return 0
+    print(resp or "(no response)", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

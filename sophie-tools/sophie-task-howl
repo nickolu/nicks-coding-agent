@@ -9,11 +9,21 @@ interrupt or redirect.
 Usage:
   sophie-task-howl "Please file a GitHub issue in claude-bridge: title 'X', body 'Y'"
   echo "Fix the bot reconnect bug" | sophie-task-howl
+  sophie-task-howl --auth "active_tasks.md: Mother's Day gifts" "Pick up potted lavender at <nursery>"
+
+Autonomy gate:
+  When SOPHIE_AUTONOMY=1 is set (autonomy-tick wakeup), delegation is refused
+  unless --auth "<reason>" is provided. The reason is logged so Nick can audit
+  why Sophie delegated during unattended time. Convention: cite the specific
+  active_tasks.md entry that has `delegate_to_howl: true` in its body.
+
+  Legacy override SOPHIE_TASK_HOWL_FORCE=1 is still honored for back-compat.
 
 Notes:
   Be specific. Give Howl the repo, the goal, and any context. He doesn't have
   your conversation with Nick — only what you send.
 """
+import argparse
 import json
 import os
 import socket
@@ -23,31 +33,39 @@ SOCKET = "/run/sophie-discord.sock"
 
 
 def main() -> int:
-    args = sys.argv[1:]
-    if args == ["-h"] or args == ["--help"]:
-        print(__doc__)
-        return 0
-    msg = " ".join(args).strip() if args else sys.stdin.read().strip()
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=True,
+    )
+    p.add_argument("--auth", default="",
+                   help='Authorization reason (required when running under SOPHIE_AUTONOMY=1). '
+                        'Convention: cite the active_tasks.md entry, e.g. '
+                        '"active_tasks: Mother\'s Day gifts (delegate_to_howl: true)".')
+    p.add_argument("task", nargs="*", help="The task text (falls back to stdin).")
+    args = p.parse_args()
+
+    msg = " ".join(args.task).strip() if args.task else sys.stdin.read().strip()
     if not msg:
         print("sophie-task-howl: empty task — nothing sent", file=sys.stderr)
         return 1
 
-    # Soft autonomy gate: refuse during unattended autonomy ticks unless
-    # explicitly authorized. The bridge sets SOPHIE_AUTONOMY=1 when firing
-    # an invoke schedule with pause_when_off=True. Sophie can override per
-    # invocation via SOPHIE_TASK_HOWL_FORCE=1 when she has clear authorization
-    # (e.g. an active_tasks.md entry Nick flagged for delegation).
-    if os.environ.get("SOPHIE_AUTONOMY") == "1" and os.environ.get("SOPHIE_TASK_HOWL_FORCE") != "1":
+    # Soft autonomy gate: refuse during unattended autonomy ticks unless the
+    # call carries explicit authorization. The bridge sets SOPHIE_AUTONOMY=1
+    # when firing an invoke schedule with pause_when_off=True.
+    auth_reason = args.auth.strip()
+    legacy_force = os.environ.get("SOPHIE_TASK_HOWL_FORCE") == "1"
+    if os.environ.get("SOPHIE_AUTONOMY") == "1" and not (auth_reason or legacy_force):
         sys.stderr.write(
             "sophie-task-howl: refusing to delegate from an autonomy tick.\n"
             "Loop-safety: Sophie should only delegate when Nick is in the conversation\n"
-            "or has explicitly authorized the task.\n"
-            "If you have explicit authorization, override with:\n"
-            "  SOPHIE_TASK_HOWL_FORCE=1 sophie-task-howl \"<task>\"\n"
+            "or has explicitly authorized the task in active_tasks.md.\n"
+            "If you have explicit authorization, pass it as the reason:\n"
+            "  sophie-task-howl --auth \"active_tasks: <task name>\" \"<task>\"\n"
         )
         return 2
 
-    payload = {"type": "post_to_howl", "content": msg}
+    payload = {"type": "post_to_howl", "content": msg, "auth_reason": auth_reason}
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.connect(SOCKET)

@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+"""Pre-response context pulse — hold the whole picture before you reply.
+
+Surfaced repeatedly by Nick (2026-05-14, reiterated 2026-05-22): Sophie's
+responses drift into a formulaic shape (intro → bulleted brainstorm with ##
+headers → "my picks" → closing question) and answer the immediate question
+without holding him as a whole person. The behavioral fix in
+natural-presence.md hasn't held on its own. This is the tooling lever (P11).
+
+Run it BEFORE composing any non-trivial reply. It gathers — cheaply, no LLM
+call — the wider context a good response should be colored by, and (if you
+pass your draft) audits that draft for the formulaic patterns Nick called out.
+
+  Roles        Nick's life roles + current status (from personal-goals)
+  Threads      live projects/threads, parked ones folded down
+  Weather      recent inbound DMs to read for emotional weather + recency
+  Protocol     the anti-pattern + diagnostic check from natural-presence.md
+  Draft audit  (with --draft/stdin) repetition vs. recent outbound, shape
+               flags (## headers, closing "?"), and which threads it ignores
+
+Examples:
+  sophie-pulse-self                          # context-only snapshot
+  sophie-pulse-self --draft "Sounds great! Here are some ideas: ..."
+  echo "<draft>" | sophie-pulse-self         # draft from stdin
+  sophie-pulse-self --dm-window 14d --format json
+
+The point is the diagnostic question, not the output: "If a friend said this
+to me, would it feel like they were paying attention to everything I've told
+them this month, or like they were just answering the immediate question?"
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("SOPHIE_STATE_DIR", "/var/lib/sophie-discord"))
+NOTEBOOK = Path(os.environ.get("SOPHIE_NOTEBOOK_DIR", "/notebook"))
+
+INBOUND = STATE_DIR / "inbound-messages.jsonl"
+OUTBOUND = STATE_DIR / "outbound-messages.jsonl"
+GOALS_README = NOTEBOOK / "personal-goals" / "README.md"
+PROTOCOL = NOTEBOOK / "sophie-protocols" / "natural-presence.md"
+# Presence ledger lives in Sophie's writable space (STATE_DIR is root-owned).
+# The heartbeat appends a topic tag here after each proactive send so it won't
+# resurface the same theme within the topic window.
+LEDGER = Path(os.environ.get(
+    "SOPHIE_PRESENCE_LEDGER", str(NOTEBOOK / ".sophie-presence" / "topics-surfaced.jsonl")))
+
+# Stopwords kept small on purpose — overlap scoring wants content words, but
+# the formulaic close-with-a-question shape is exactly what we want to catch,
+# so question/brainstorm filler ("ideas", "thoughts", "here") stays in.
+STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "if", "of", "to", "in", "on", "for",
+    "with", "is", "are", "was", "were", "be", "been", "it", "this", "that",
+    "you", "your", "i", "me", "my", "we", "he", "she", "they", "as", "at",
+    "by", "from", "so", "do", "does", "can", "could", "would", "will", "what",
+    "how", "not", "no", "yes", "yeah", "ok", "okay",
+}
+
+
+def parse_window(spec: str) -> timedelta:
+    m = re.fullmatch(r"(\d+)\s*([mhd])", spec.strip())
+    if not m:
+        raise SystemExit(f"bad window {spec!r}: expected like 90m, 6h, 7d")
+    n, unit = int(m.group(1)), m.group(2)
+    return {"m": timedelta(minutes=n), "h": timedelta(hours=n), "d": timedelta(days=n)}[unit]
+
+
+def parse_ts(s: str) -> datetime | None:
+    try:
+        s = s.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def fmt_local(ts_iso: str) -> str:
+    dt = parse_ts(ts_iso)
+    return dt.astimezone().strftime("%a %H:%M") if dt else ts_iso
+
+
+def words(text: str) -> set[str]:
+    toks = re.findall(r"[a-z0-9']+", text.lower())
+    return {t for t in toks if t not in STOPWORDS and len(t) > 2}
+
+
+def jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def read_ledger() -> list[dict]:
+    return read_jsonl(LEDGER)
+
+
+def append_ledger(topic: str, snippet: str) -> None:
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    row = {"ts": datetime.now(tz=timezone.utc).isoformat(),
+           "topic": topic, "snippet": " ".join(snippet.split())[:160]}
+    with LEDGER.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+# ---- goals doc parsing -----------------------------------------------------
+
+def parse_roles(md: str) -> list[dict]:
+    """Pull '### N. Name' headers and their first '**Status: ...**' line."""
+    roles = []
+    cur = None
+    for line in md.splitlines():
+        hm = re.match(r"^###\s+(\d+)\.\s+(.+?)\s*$", line)
+        if hm:
+            cur = {"rank": int(hm.group(1)), "name": hm.group(2), "status": ""}
+            roles.append(cur)
+            continue
+        if line.startswith("##"):
+            cur = None
+            continue
+        if cur and not cur["status"]:
+            sm = re.search(r"\*\*Status:\s*(.+?)\*\*", line)
+            if sm:
+                cur["status"] = sm.group(1).strip()
+    return roles
+
+
+def parse_projects(md: str) -> list[dict]:
+    """Parse the Projects Map markdown table into rows."""
+    out = []
+    in_table = False
+    for line in md.splitlines():
+        if line.strip().startswith("## Projects Map"):
+            in_table = True
+            continue
+        if in_table:
+            if line.startswith("##"):
+                break
+            if not line.strip().startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if len(cells) < 4 or cells[0].lower() in ("project", ""):
+                continue
+            if set(cells[0]) <= {"-", " "}:  # separator row
+                continue
+            out.append({"project": cells[0], "role": cells[1],
+                        "status": cells[2], "priority": cells[3]})
+    return out
+
+
+def protocol_reminders(md: str) -> list[str]:
+    """Pull the anti-pattern + diagnostic lines from natural-presence.md."""
+    out = []
+    for line in md.splitlines():
+        s = line.strip()
+        if s.startswith("**Anti-pattern to break:**") or s.startswith("**Diagnostic check before sending:**"):
+            out.append(re.sub(r"\*\*", "", s))
+    return out
+
+
+# ---- main ------------------------------------------------------------------
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--draft", default="",
+                   help="Draft reply to audit (falls back to stdin if piped).")
+    p.add_argument("--dm-window", default="7d",
+                   help="How far back to read inbound DMs for emotional weather (default 7d).")
+    p.add_argument("--recent-outbound", type=int, default=12,
+                   help="How many recent outbound messages to check the draft against (default 12).")
+    p.add_argument("--topic", default="",
+                   help="Short kebab topic tag for this draft (repeat-check + --record).")
+    p.add_argument("--topic-window", default="3d",
+                   help="Window for topic-recurrence / ledger check (default 3d).")
+    p.add_argument("--record", action="store_true",
+                   help="Append --topic to the presence ledger (run this AFTER you send) and exit.")
+    p.add_argument("--format", choices=("text", "json"), default="text")
+    args = p.parse_args()
+
+    draft = args.draft.strip()
+    if not draft and not sys.stdin.isatty():
+        draft = sys.stdin.read().strip()
+
+    if args.record:
+        if not args.topic:
+            print("sophie-pulse-self --record requires --topic <tag>", file=sys.stderr)
+            return 2
+        append_ledger(args.topic, draft)
+        print(f"recorded topic '{args.topic}' to presence ledger — won't resurface within {args.topic_window}")
+        return 0
+
+    now = datetime.now(tz=timezone.utc)
+    since = now - parse_window(args.dm_window)
+
+    goals_md = GOALS_README.read_text(encoding="utf-8") if GOALS_README.exists() else ""
+    proto_md = PROTOCOL.read_text(encoding="utf-8") if PROTOCOL.exists() else ""
+    roles = parse_roles(goals_md)
+    projects = parse_projects(goals_md)
+    # "Alive" honors Nick's own framing: everything but the primary vehicle is
+    # explicitly parked/archived in the goals doc (the anti-fragmentation rule).
+    # Keeping the alive set tight makes the "silent on" nudge point at what's
+    # supposed to stay in view, not at a wall of parked side-projects.
+    def is_parked(pr: dict) -> bool:
+        blob = (pr["status"] + " " + pr["priority"]).lower()
+        return "park" in blob or "archiv" in blob
+    active = [pr for pr in projects if not is_parked(pr)]
+    parked = [pr for pr in projects if is_parked(pr)]
+
+    # Emotional weather: recent inbound DMs.
+    inbound = [r for r in read_jsonl(INBOUND)
+               if (ts := parse_ts(r.get("ts", ""))) and ts >= since]
+    inbound.sort(key=lambda r: r.get("ts", ""))
+    last_dm = parse_ts(inbound[-1]["ts"]) if inbound else None
+    mins_since = int((now - last_dm).total_seconds() // 60) if last_dm else None
+
+    # Draft audit + repetition verdict.
+    audit: dict = {}
+    verdict = "SEND"
+    verdict_reasons: list[str] = []
+    if draft:
+        dwords = words(draft)
+        all_out = [r for r in read_jsonl(OUTBOUND) if (r.get("content") or "").strip()]
+
+        # (1) Immediate-repetition: word overlap vs recent conversational outbound.
+        recent = [r for r in all_out if not r.get("tag")][-args.recent_outbound:]
+        sims = sorted(
+            ({"ts": r["ts"], "score": round(jaccard(dwords, words(r["content"])), 2),
+              "snippet": " ".join(r["content"].split())[:90]} for r in recent),
+            key=lambda x: x["score"], reverse=True)
+        top = sims[0] if sims else None
+
+        # (2) Topic-recurrence: has this theme been *proactively* surfaced, or
+        # logged in the ledger, within the topic window? This catches the
+        # day-after-day theme repeat the immediate check misses.
+        tsince = now - parse_window(args.topic_window)
+        inbound_dts = [d for d in (parse_ts(r.get("ts", "")) for r in read_jsonl(INBOUND)) if d]
+
+        def is_proactive(r: dict) -> bool:
+            t = parse_ts(r.get("ts", ""))
+            if not t or t < tsince or r.get("tag"):
+                return False
+            return not any(0 <= (t - i).total_seconds() <= 720 for i in inbound_dts)
+
+        # A theme matches if it shares enough salient words. Jaccard alone
+        # misses reworded repeats (the Bambu case: same theme, ~0.2 overlap),
+        # so we also flag >=3 shared content words.
+        def theme_match(other: str) -> tuple[bool, float, list[str]]:
+            cw = words(other)
+            shared = dwords & cw
+            sc = round(jaccard(dwords, cw), 2)
+            return (sc >= 0.30 or len(shared) >= 3), sc, sorted(shared)
+
+        topic_hits = []
+        for r in all_out:
+            if not is_proactive(r):
+                continue
+            hit, sc, shared = theme_match(r["content"])
+            if hit:
+                t = parse_ts(r["ts"])
+                topic_hits.append({"source": "sent", "ts": r["ts"], "score": sc,
+                                   "age_h": round((now - t).total_seconds() / 3600, 1),
+                                   "shared": shared[:6],
+                                   "snippet": " ".join(r["content"].split())[:90]})
+        ledger_in_window = [r for r in read_ledger()
+                            if (d := parse_ts(r.get("ts", ""))) and d >= tsince]
+        tag_repeat = bool(args.topic and any(r.get("topic") == args.topic for r in ledger_in_window))
+        for r in ledger_in_window:
+            hit, sc, shared = theme_match(r.get("snippet", ""))
+            if hit or (args.topic and r.get("topic") == args.topic):
+                t = parse_ts(r["ts"])
+                topic_hits.append({"source": "ledger", "ts": r["ts"], "score": sc,
+                                   "age_h": round((now - t).total_seconds() / 3600, 1),
+                                   "topic": r.get("topic"), "shared": shared[:6],
+                                   "snippet": (r.get("snippet") or "")[:90]})
+        topic_hits.sort(key=lambda x: x["score"], reverse=True)
+
+        # Shape signals (cautions, not blockers).
+        ends_q = draft.rstrip().endswith("?")
+        prior_q = sum(1 for r in recent if (r["content"] or "").rstrip().endswith("?"))
+        has_headers = bool(re.search(r"^#{2,}\s", draft, re.M))
+        bullets = len(re.findall(r"^\s*[-*]\s", draft, re.M))
+        touched = [pr["project"] for pr in active if words(pr["project"]) & dwords]
+        ignored = [pr["project"] for pr in active if pr["project"] not in touched]
+
+        # Verdict: HOLD on real repetition; shape issues are cautions only.
+        if top and top["score"] >= 0.35:
+            verdict = "HOLD"
+            verdict_reasons.append(
+                f"{top['score']} word overlap with a recent message — you're about to repeat yourself")
+        if tag_repeat:
+            verdict = "HOLD"
+            verdict_reasons.append(
+                f"topic '{args.topic}' already surfaced within {args.topic_window} (per ledger)")
+        if topic_hits:
+            verdict = "HOLD"
+            verdict_reasons.append(
+                f"same theme surfaced {len(topic_hits)}x in the last {args.topic_window} "
+                f"(closest {topic_hits[0]['age_h']}h ago) — don't re-raise without his engagement")
+
+        cautions = []
+        if ends_q and prior_q >= max(2, len(recent) // 2):
+            cautions.append(f"closes with a question, like {prior_q}/{len(recent)} recent replies — vary the shape")
+        if has_headers and bullets >= 3:
+            cautions.append("## headers + bullets = the formulaic brainstorm shape; try prose or brevity")
+
+        audit = {
+            "verdict": verdict, "verdict_reasons": verdict_reasons,
+            "ends_with_question": ends_q,
+            "recent_replies_ending_in_question": f"{prior_q}/{len(recent)}",
+            "uses_headers": has_headers, "bullet_lines": bullets,
+            "threads_touched": touched, "threads_not_touched": ignored,
+            "nearest_recent_messages": sims[:3],
+            "topic_recurrence_hits": topic_hits[:3],
+            "cautions": cautions,
+        }
+
+    if args.format == "json":
+        print(json.dumps({
+            "generated": now.isoformat(),
+            "verdict": verdict if draft else None,
+            "roles": roles,
+            "threads_active": active, "threads_parked": parked,
+            "emotional_weather": {
+                "window": args.dm_window, "inbound_count": len(inbound),
+                "minutes_since_last_dm": mins_since,
+                "recent_inbound": [{"ts": r["ts"], "content": r.get("content", "")}
+                                   for r in inbound[-5:]],
+            },
+            "protocol_reminders": protocol_reminders(proto_md),
+            "draft_audit": audit or None,
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    out = []
+    if draft:
+        banner = f"VERDICT: {verdict}"
+        if verdict_reasons:
+            banner += " — " + "; ".join(verdict_reasons)
+        out += [banner, ""]
+    out.append("PULSE — hold the whole picture before you reply")
+    out.append("")
+    out.append("ROLES (priority order — name the one this serves when it lands naturally):")
+    for r in roles:
+        out.append(f"  {r['rank']}. {r['name']:<12} {r['status']}")
+    out.append("")
+    out.append("THREADS ALIVE:")
+    for pr in active:
+        out.append(f"  • {pr['project']} [{pr['role']}] — {pr['status']} ({pr['priority']})")
+    if parked:
+        out.append(f"  parked: {', '.join(pr['project'] for pr in parked)}")
+    out.append("")
+    out.append(f"EMOTIONAL WEATHER (last {args.dm_window} — read the words, match your tone):")
+    if mins_since is not None:
+        h, m = divmod(mins_since, 60)
+        out.append(f"  last DM from Nick: {h}h{m:02d}m ago · {len(inbound)} inbound in window")
+    else:
+        out.append(f"  no inbound DMs in the last {args.dm_window}")
+    for r in inbound[-5:]:
+        out.append(f"    {fmt_local(r['ts'])} — {' '.join((r.get('content') or '').split())[:120]}")
+    out.append("")
+    out.append("PROTOCOL CHECK:")
+    for line in protocol_reminders(proto_md):
+        out.append(f"  {line}")
+
+    if draft:
+        out.append("")
+        out.append(f"DRAFT AUDIT — verdict: {verdict}")
+        for r in verdict_reasons:
+            out.append(f"  ⛔ {r}")
+        for c in audit["cautions"]:
+            out.append(f"  ⚠ {c}")
+        if not verdict_reasons and not audit["cautions"]:
+            out.append("  ✓ clean — no repetition or formulaic-shape flags")
+        out.append(f"  shape: headers={audit['uses_headers']} bullets={audit['bullet_lines']} "
+                   f"ends_with_?={audit['ends_with_question']} "
+                   f"(recent closing-?: {audit['recent_replies_ending_in_question']})")
+        if audit["threads_not_touched"]:
+            out.append(f"  threads your draft is silent on: {', '.join(audit['threads_not_touched'])}")
+        if audit["topic_recurrence_hits"]:
+            out.append(f"  this theme already surfaced in the last {args.topic_window}:")
+            for h in audit["topic_recurrence_hits"]:
+                tag = f" [{h['topic']}]" if h.get("topic") else ""
+                shared = f" (shared: {', '.join(h['shared'])})" if h.get("shared") else ""
+                out.append(f"    {h['age_h']}h ago{tag} — {h['snippet']}{shared}")
+        elif audit["nearest_recent_messages"]:
+            out.append("  nearest recent messages (overlap):")
+            for s in audit["nearest_recent_messages"]:
+                out.append(f"    {s['score']}  {fmt_local(s['ts'])} — {s['snippet']}")
+        out.append("")
+        out.append('  Ask: "would this feel like someone who has been paying attention all month,')
+        out.append('   or like I just answered the immediate question?" If the latter — rewrite.')
+
+    print("\n".join(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

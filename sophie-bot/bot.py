@@ -14,6 +14,7 @@ import io
 import json
 import logging
 import os
+import shlex
 import socket
 import subprocess
 import time
@@ -85,6 +86,12 @@ LOCKS: dict[str, asyncio.Lock] = {}
 
 # Active watchers: {watcher_id: {"task": asyncio.Task, "info": dict}}
 WATCHERS: dict[str, dict] = {}
+
+# Active "await howl reply" listeners. Each entry maps a uuid to an asyncio.Task
+# that polls the howl-channel JSONL and resolves when a non-Sophie message
+# arrives or the deadline passes. Kept in-memory only — a bot restart abandons
+# in-flight awaits, which is fine: Sophie can reissue.
+AWAITS: dict[str, dict] = {}
 
 # Persistent scheduled tasks (reminders + autonomy ticks).
 # A schedule is a dict with: id, kind ("notify"|"invoke"), fire_at_utc (ISO string),
@@ -444,6 +451,119 @@ async def post_to_howl(content: str) -> str:
         return f"error: send failed: {e}"
 
 
+async def await_howl_loop(await_id: str, info: dict):
+    """Poll the howl-channel JSONL until a non-Sophie message arrives after
+    `since_iso` or the `deadline` passes. Result is DMed to Nick directly —
+    Sophie is not woken up, so no token cost per check.
+    """
+    since_iso: str = info["since_iso"]
+    deadline: float = info["deadline"]
+    every: int = info["every"]
+    label: str = info.get("label", "")
+    log.info(
+        f"await {await_id[:8]} started: since={since_iso} timeout={int((deadline - time.time()) / 60)}min "
+        f"every={every}s label={label[:60]!r}"
+    )
+    try:
+        since_dt = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
+    except Exception:
+        log.exception(f"await {await_id[:8]}: bad since_iso {since_iso!r}")
+        AWAITS.pop(await_id, None)
+        return
+
+    try:
+        while time.time() < deadline:
+            # Read howl-channel.jsonl directly. The bot is the only writer,
+            # so a partial line race is theoretically possible — but the file
+            # is line-buffered and we tolerate JSON decode errors below.
+            try:
+                lines = HOWL_LOG.read_text(encoding="utf-8").splitlines()
+            except FileNotFoundError:
+                lines = []
+            new_msgs: list[dict] = []
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(row["ts"].replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                if ts > since_dt and not row.get("is_bot") is True:
+                    # Surface any non-bot (i.e. Nick) AND Howl-bot replies.
+                    # Sophie's own outbound is logged separately and never
+                    # written to HOWL_LOG, so anything here is a fresh reply.
+                    new_msgs.append(row)
+            if new_msgs:
+                summary_lines = [
+                    f"✅ **Howl replied** (await `{await_id[:8]}`)"
+                ]
+                if label:
+                    summary_lines.append(f"Task: {label[:160]}")
+                for m in new_msgs[:5]:
+                    author = m.get("author_name") or "?"
+                    content = " ".join((m.get("content") or "").split())[:300]
+                    summary_lines.append(f"  • {author}: {content}")
+                if len(new_msgs) > 5:
+                    summary_lines.append(f"  …and {len(new_msgs) - 5} more")
+                await send_dm("\n".join(summary_lines))
+                log.info(f"await {await_id[:8]} resolved with {len(new_msgs)} message(s)")
+                return
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(every, remaining))
+
+        # Deadline elapsed without a reply.
+        timeout_msg = f"⏰ **Howl didn't reply** (await `{await_id[:8]}`)"
+        if label:
+            timeout_msg += f"\nTask: {label[:160]}"
+        timeout_msg += f"\nWaited {int((time.time() - (deadline - info['max_wait_sec'])) / 60)}min, no response in #howl."
+        await send_dm(timeout_msg)
+        log.info(f"await {await_id[:8]} timed out")
+    except asyncio.CancelledError:
+        log.info(f"await {await_id[:8]} cancelled")
+    finally:
+        AWAITS.pop(await_id, None)
+
+
+def start_await_howl(payload: dict) -> str:
+    """Start an await-howl-reply task from a socket payload. Returns 'ok:<id>'."""
+    max_wait_sec = max(60, min(int(payload.get("max_wait_sec", 1800)), 6 * 3600))
+    every = max(30, min(int(payload.get("check_every_sec", 300)), max_wait_sec))
+    label = (payload.get("label") or "")[:200]
+    # since_iso: where to start scanning howl-channel. Default to last-task
+    # timestamp (i.e. Sophie's most recent delegation).
+    since_iso = (payload.get("since_iso") or "").strip()
+    if not since_iso and LAST_TASK_PATH.exists():
+        try:
+            data = json.loads(LAST_TASK_PATH.read_text())
+            since_iso = data.get("last_task_utc", "")
+        except Exception:
+            pass
+    if not since_iso:
+        # No prior delegation recorded — fall back to "since 30s ago" so the
+        # caller can still use this primitive for an ad-hoc wait.
+        since_iso = (now_utc() - timedelta(seconds=30)).isoformat()
+
+    aid = str(uuid.uuid4())
+    info = {
+        "since_iso": since_iso,
+        "deadline": time.time() + max_wait_sec,
+        "max_wait_sec": max_wait_sec,
+        "every": every,
+        "label": label,
+        "created": time.time(),
+    }
+    task = asyncio.create_task(await_howl_loop(aid, info))
+    AWAITS[aid] = {"task": task, "info": info}
+    return f"ok:{aid}"
+
+
 async def watcher_loop(watcher_id: str, info: dict):
     """Poll a command at an interval until match or timeout."""
     command = info["command"]
@@ -671,14 +791,65 @@ def compute_next_fire(s: dict) -> datetime | None:
     return None
 
 
+async def is_calendar_busy_now() -> bool:
+    """Return True iff Nick has a calendar event covering this instant.
+
+    Uses `gws calendar freebusy query` against his primary calendar via an
+    ephemeral Sophie sandbox container. Spends ~1-2s on docker startup per
+    call — acceptable for a per-fire check, not for hot-path use.
+
+    Any failure (gws not authed, no network, parse error) returns False so
+    `skip_if_busy` errs on the side of firing the reminder rather than
+    silently swallowing it.
+    """
+    now = now_utc()
+    params = json.dumps({
+        "timeMin": now.isoformat(),
+        "timeMax": (now + timedelta(seconds=1)).isoformat(),
+        "items": [{"id": "primary"}],
+    })
+    cmd = f"gws calendar freebusy query --json {shlex.quote(params)}"
+    output = await run_check_command(cmd)
+    # gws prints JSON to stdout; run_check_command concatenates stdout+stderr.
+    # Try to find a JSON object in the output.
+    try:
+        # The JSON object may be embedded if gws emitted any auth warnings.
+        start = output.find("{")
+        end = output.rfind("}")
+        if start == -1 or end == -1:
+            return False
+        data = json.loads(output[start:end + 1])
+        busy = data.get("calendars", {}).get("primary", {}).get("busy", [])
+        return bool(busy)
+    except Exception:
+        log.warning(f"is_calendar_busy_now: parse failed, output={output[:200]!r}")
+        return False
+
+
 async def fire_schedule(s: dict):
     sid = s["id"]
     desc = s.get("description", "")[:60]
     log.info(f"schedule {sid[:8]} firing: kind={s['kind']} desc={desc!r}")
     try:
         if s["kind"] == "notify":
+            if s.get("skip_if_busy"):
+                try:
+                    busy = await is_calendar_busy_now()
+                except Exception:
+                    log.exception(f"schedule {sid[:8]} busy-check errored; firing anyway")
+                    busy = False
+                if busy:
+                    log.info(f"schedule {sid[:8]} skipped (calendar busy)")
+                    return
             msg = s.get("message", "(no message)")
-            await send_dm(f"⏰ **Reminder**\n{msg}")
+            tag = (s.get("track") or "").strip()
+            reactions = s.get("reactions") or []
+            if isinstance(reactions, str):
+                reactions = [e.strip() for e in reactions.split(",") if e.strip()]
+            # Tracked habit pings skip the "⏰ **Reminder**" header — the tag-scoped
+            # message stands on its own so Nick's reaction is what gets logged.
+            body = msg if tag else f"⏰ **Reminder**\n{msg}"
+            await send_dm(body, tag=tag, reactions=reactions or None)
             record_unsolicited_dm()
         elif s["kind"] == "invoke":
             prompt = s.get("prompt", "")
@@ -857,6 +1028,19 @@ def schedule_add(payload: dict) -> str:
         rec = _validate_recurrence(payload.get("recurrence"))
     except ValueError as e:
         return f"error: {e}"
+    # --track / --reactions only apply to notify schedules. Normalize reactions
+    # to a list so the JSONL on-disk shape stays consistent across restarts.
+    track = (payload.get("track") or "").strip()
+    reactions_field = payload.get("reactions") or []
+    if isinstance(reactions_field, str):
+        reactions_list = [e.strip() for e in reactions_field.split(",") if e.strip()]
+    elif isinstance(reactions_field, list):
+        reactions_list = [str(e) for e in reactions_field if str(e).strip()]
+    else:
+        reactions_list = []
+    if kind != "notify" and (track or reactions_list):
+        return "error: --track/--reactions only valid with kind=notify"
+
     sid = str(uuid.uuid4())
     desc_default = payload.get("message") or payload.get("prompt", "")
     entry = {
@@ -869,6 +1053,9 @@ def schedule_add(payload: dict) -> str:
         "session_id": payload.get("session_id") or None,
         "pause_when_off": bool(payload.get("pause_when_off", False)),
         "defer_if_quiet": bool(payload.get("defer_if_quiet", False)),
+        "skip_if_busy": bool(payload.get("skip_if_busy", False)),
+        "track": track,
+        "reactions": reactions_list,
         "description": (payload.get("description") or desc_default)[:120],
         "created_utc": now_utc().isoformat(),
     }
@@ -1049,11 +1236,24 @@ async def notify_listener():
                         pass
                     return
 
+                if ptype == "await_howl_reply":
+                    result = start_await_howl(payload)
+                    log.info(f"await_howl_reply -> {result[:80]}")
+                    try:
+                        writer.write(f"{result}\n".encode())
+                        await writer.drain()
+                    except (ConnectionResetError, BrokenPipeError):
+                        pass
+                    return
+
                 if ptype == "post_to_howl":
                     content = (payload.get("content") or payload.get("message") or "").strip()
+                    auth_reason = (payload.get("auth_reason") or "").strip()
                     if not content:
                         result = "error: post_to_howl requires non-empty content"
                     else:
+                        if auth_reason:
+                            log.info(f"post_to_howl auth_reason: {auth_reason[:200]}")
                         result = await post_to_howl(content)
                     log.info(f"post_to_howl -> {result[:80]}")
                     try:
@@ -1379,8 +1579,16 @@ async def on_message(message: discord.Message):
             await message.add_reaction("✅")
         except Exception:
             pass
+        # Record conversational outbound with tag="" so reactions Nick taps on
+        # these replies can be enriched with source-message context by
+        # sophie-recent-dms (otherwise the reaction shows as "on msg <id>"
+        # with no snippet).
         for chunk in split_discord(reply):
-            await message.channel.send(chunk)
+            sent = await message.channel.send(chunk)
+            try:
+                _record_outbound(sent.channel.id, sent.id, chunk, tag="")
+            except Exception:
+                log.exception("on_message: failed to record outbound")
 
 
 @client.event

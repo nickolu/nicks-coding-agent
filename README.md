@@ -44,6 +44,7 @@ This README is the **file-to-host-path map** for actually deploying or restoring
 | `sophie-config/CLAUDE.md` | `/home/sophie/notebook/CLAUDE.md` (Sophie's persona / instructions) |
 | `sophie-tools/sophie-notify` | `/home/sophie/.claude-container/sophie-notify` (chmod +x) |
 | `sophie-tools/sophie-watch` | `/home/sophie/.claude-container/sophie-watch` (chmod +x) |
+| `sophie-tools/sophie-image`, `sophie-attach`, `sophie-schedule`, `sophie-recent-dms`, `sophie-recent-howl`, `sophie-task-howl`, `sophie-await-howl-reply` | `/home/sophie/.claude-container/<name>` (chmod +x) |
 | `sophie-systemd/sophie-discord.service` | `/etc/systemd/system/sophie-discord.service` |
 
 ## What is **not** in this repo

@@ -25,6 +25,13 @@ Examples:
   # Defer a reminder past quiet hours if it would land inside
   sophie-schedule --at "2026-05-06T07:30" --message "stretch" --defer-if-quiet
 
+  # Tracked habit reminder with tap-to-ack reactions (notify-only)
+  sophie-schedule --at "2026-05-09T10:00" --recurring daily \\
+                  --message "water?" --track water --reactions "💧,⏭️"
+
+  # Skip the ping if Nick is in a meeting at fire time
+  sophie-schedule --at "2026-05-09T13:00" --message "stand" --track stand --skip-if-busy
+
   # Manage
   sophie-schedule --list
   sophie-schedule --cancel <id-prefix>
@@ -85,6 +92,13 @@ p.add_argument("--autonomy", action="store_true",
                help="Mark as an autonomy tick — gated by !autonomy off and quiet hours")
 p.add_argument("--defer-if-quiet", action="store_true",
                help="If fire time falls in quiet hours, push to the end of the window")
+p.add_argument("--skip-if-busy", action="store_true",
+               help="Skip the fire if Nick has a calendar event covering the fire time "
+                    "(notify only — consults gws calendar at fire time)")
+p.add_argument("--track", default="", help="Tag for grouping reactions (notify only — e.g. water, stand).")
+p.add_argument("--reactions", default="",
+               help="Comma-separated emojis to pre-attach when the reminder fires "
+                    "(notify only; defaults to '✅,⏭️' when --track is set).")
 p.add_argument("--description", default="", help="Short label shown in !schedules")
 p.add_argument("--list", action="store_true", help="List all scheduled tasks")
 p.add_argument("--cancel", metavar="ID", help="Cancel a schedule by ID prefix")
@@ -114,6 +128,19 @@ try:
     else:
         sys.exit("must specify --message (notify) or --prompt (invoke)")
 
+    # --track defaults to ✅,⏭️ when no explicit --reactions given (mirrors sophie-notify).
+    track = args.track.strip()
+    if args.reactions:
+        reactions = [e.strip() for e in args.reactions.split(",") if e.strip()]
+    elif track:
+        reactions = ["✅", "⏭️"]
+    else:
+        reactions = []
+    if kind != "notify" and (track or reactions):
+        sys.exit("--track/--reactions are only valid with --message (notify)")
+    if args.skip_if_busy and kind != "notify":
+        sys.exit("--skip-if-busy is only valid with --message (notify)")
+
     payload = {
         "type": "schedule_add",
         "kind": kind,
@@ -124,6 +151,9 @@ try:
         "session_id": args.session_id,
         "pause_when_off": bool(args.autonomy),
         "defer_if_quiet": bool(args.defer_if_quiet),
+        "skip_if_busy": bool(args.skip_if_busy),
+        "track": track,
+        "reactions": reactions,
         "description": args.description,
     }
     resp = send(payload)
