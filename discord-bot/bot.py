@@ -590,12 +590,18 @@ async def notify_listener():
 
                 # Default: treat as notification
                 msg = payload.get("message", "")
+                channel_id = payload.get("channel_id", "")
             else:
                 msg = text
+                channel_id = ""
 
             if msg:
-                await send_dm(msg)
-                log.info(f"notify -> user: {msg[:80]}")
+                if channel_id:
+                    await post_to_channel(channel_id, msg)
+                    log.info(f"notify -> channel {channel_id}: {msg[:80]}")
+                else:
+                    await send_dm(msg)
+                    log.info(f"notify -> user: {msg[:80]}")
             try:
                 writer.write(b"ok\n")
                 await writer.drain()
