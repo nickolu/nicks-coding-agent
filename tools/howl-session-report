@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Publish a session progress update to the howl channel.
+
+Usage:
+  howl-session-report --session <name> "step 3 complete"
+  echo "loop finished" | howl-session-report --session my-loop
+  howl-session-report --session deploy --channel general "deployed to prod"
+
+Posts:  [Session: <name>] <message>
+
+Sophie reads session updates with:
+  sophie-recent-howl --loop <name>
+
+Channel defaults to HOWL_CHANNEL_HOWL env var. Use --channel to override.
+The underlying howl-post rate limit applies (default 60s per channel).
+Use --force to bypass the rate limit when intentional.
+"""
+import argparse
+import json
+import os
+import sys
+import socket
+import time
+from pathlib import Path
+
+HOWL_POST_SOCKET = "/run/claude-discord.sock"
+RATELIMIT_PATH = Path(os.environ.get("HOME", "/home/claude")) / ".claude" / "howl-post-ratelimit.json"
+DEFAULT_RATE_SEC = 60
+
+
+def resolve_channel(name: str) -> str:
+    if name.isdigit():
+        return name
+    env_key = f"HOWL_CHANNEL_{name.upper()}"
+    val = os.environ.get(env_key, "").strip()
+    if val and val.isdigit():
+        return val
+    return name
+
+
+def load_ratelimit() -> dict:
+    try:
+        return json.loads(RATELIMIT_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def save_ratelimit(state: dict) -> None:
+    try:
+        RATELIMIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        RATELIMIT_PATH.write_text(json.dumps(state))
+    except Exception:
+        pass
+
+
+def check_ratelimit(channel_id: str, rate_sec: int) -> tuple[bool, float]:
+    state = load_ratelimit()
+    last = state.get(channel_id, 0.0)
+    elapsed = time.time() - last
+    if elapsed < rate_sec:
+        return False, rate_sec - elapsed
+    return True, 0.0
+
+
+def record_post(channel_id: str) -> None:
+    state = load_ratelimit()
+    state[channel_id] = time.time()
+    save_ratelimit(state)
+
+
+def send(payload) -> None:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(HOWL_POST_SOCKET)
+    s.sendall(json.dumps(payload).encode("utf-8"))
+    s.shutdown(socket.SHUT_WR)
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+    s.close()
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--session", "-s",
+        required=True,
+        metavar="NAME",
+        help="Session name label (e.g. 'deploy', 'audit-run').",
+    )
+    p.add_argument(
+        "--channel", "-c",
+        default="howl",
+        metavar="NAME_OR_ID",
+        help="Channel name or ID (default: 'howl', resolved via HOWL_CHANNEL_HOWL).",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip rate-limit check.",
+    )
+    p.add_argument("message", nargs="*", help="Message text. Falls back to stdin if omitted.")
+    args = p.parse_args()
+
+    msg = " ".join(args.message).strip() if args.message else sys.stdin.read().strip()
+    if not msg:
+        return 0
+
+    session_name = args.session.strip()
+    formatted = f"[Session: {session_name}] {msg}"
+    channel_id = resolve_channel(args.channel)
+
+    rate_sec = int(os.environ.get("HOWL_POST_RATE_SEC", DEFAULT_RATE_SEC))
+    if channel_id and not args.force:
+        allowed, wait = check_ratelimit(channel_id, rate_sec)
+        if not allowed:
+            print(
+                f"howl-session-report: rate limited — posted recently to channel {channel_id!r}. "
+                f"Wait {wait:.0f}s or use --force.",
+                file=sys.stderr,
+            )
+            return 1
+
+    try:
+        if channel_id:
+            send({"type": "notify", "message": formatted, "channel_id": channel_id})
+            record_post(channel_id)
+        else:
+            send({"type": "notify", "message": formatted})
+    except FileNotFoundError:
+        print(f"howl-session-report: socket {HOWL_POST_SOCKET} not found", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"howl-session-report: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
