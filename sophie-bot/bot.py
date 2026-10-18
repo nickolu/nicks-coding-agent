@@ -81,6 +81,8 @@ DIGEST_CHANNEL_MAP: dict[int, str] = {
     for entry in _raw_digests
     if entry.get("id") and entry.get("name")
 }  # channel_id -> channel_name
+# Directory where inbound Discord attachments are saved for Sophie to read.
+ATTACHMENTS_DIR = Path(CONFIG.get("attachments_dir", "/home/sophie/notebook/attachments"))
 
 # Per-channel state: {channel_id: {"session_id": uuid, "first_call": bool}}
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -161,6 +163,36 @@ def _ensure_log_files() -> None:
             os.chmod(p, 0o644)
         except Exception:
             pass
+
+
+async def download_attachments(message: discord.Message) -> list[str]:
+    """Download message attachments to ATTACHMENTS_DIR. Returns a list of local paths.
+
+    Files are saved as <YYYYMMDDTHHMMSSZ>-<safe_filename> so they sort naturally
+    and don't collide across messages. Mode 0o644 so Sophie's container can read them
+    via the /notebook bind mount.
+    """
+    if not message.attachments:
+        return []
+    try:
+        ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        log.exception("download_attachments: could not create ATTACHMENTS_DIR")
+        return []
+    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    paths: list[str] = []
+    for att in message.attachments:
+        safe_name = re.sub(r"[^\w.\-]", "_", att.filename)
+        dest = ATTACHMENTS_DIR / f"{ts}-{safe_name}"
+        try:
+            data = await att.read()
+            dest.write_bytes(data)
+            os.chmod(dest, 0o644)
+            paths.append(str(dest))
+            log.info(f"attachment saved: {dest} ({len(data)} bytes)")
+        except Exception:
+            log.exception(f"download_attachments: failed to save {att.filename!r}")
+    return paths
 
 
 def _resolve_tag(message_id: int) -> str:
@@ -1216,6 +1248,21 @@ async def on_message(message: discord.Message):
 
     channel_id = str(message.channel.id)
     content = strip_bot_mention(message.content).strip()
+
+    # Download any image/file attachments before the content guard so
+    # attachment-only messages (no text) still reach Sophie.
+    local_attachment_paths: list[str] = []
+    if message.attachments:
+        try:
+            local_attachment_paths = await download_attachments(message)
+        except Exception:
+            log.exception("on_message: failed to download attachments")
+
+    # Augment content with attachment paths so Sophie can read them.
+    if local_attachment_paths:
+        attach_lines = "\n".join(f"[attachment: {p}]" for p in local_attachment_paths)
+        content = f"{content}\n{attach_lines}".strip() if content else attach_lines
+
     if not content:
         return
 
@@ -1226,7 +1273,8 @@ async def on_message(message: discord.Message):
         "channel_id": int(message.channel.id),
         "message_id": int(message.id),
         "author_id": int(message.author.id),
-        "content": content,
+        "content": message.content.strip(),  # original text, no attachment lines
+        "attachments": local_attachment_paths,
     })
 
     # Nick speaking to Sophie clears the Sophie→Howl hop counter — he's
