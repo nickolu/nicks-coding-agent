@@ -34,6 +34,7 @@ INBOUND_LOG = STATE_DIR / "inbound-messages.jsonl"
 OUTBOUND_LOG = STATE_DIR / "outbound-messages.jsonl"
 REACTIONS_LOG = STATE_DIR / "reactions.jsonl"
 HOWL_LOG = STATE_DIR / "howl-channel.jsonl"
+DIGESTS_LOG = STATE_DIR / "digests.jsonl"
 LAST_TICK_PATH = STATE_DIR / "last-tick.json"
 LAST_TASK_PATH = STATE_DIR / "last-task.json"
 TRIPWIRE_LOG = Path("/home/sophie/.claude-container/tripwire.log")
@@ -72,6 +73,14 @@ HOWL_TASK_RATE_LIMIT_SEC = int(CONFIG.get("howl_task_rate_limit_sec", 300))
 HOWL_MAX_CONSECUTIVE_HOPS = int(CONFIG.get("howl_max_consecutive_hops", 2))
 TIMEZONE = ZoneInfo(CONFIG.get("timezone", "America/Los_Angeles"))
 QUIET_HOURS_DEFAULT = CONFIG.get("quiet_hours") or None  # "HH:MM-HH:MM" or None
+# Optional: channels to tail for CunningBot / digest posts.
+# Format: [{"name": "music", "id": "1234567890"}, ...]
+_raw_digests = CONFIG.get("digest_channels") or []
+DIGEST_CHANNEL_MAP: dict[int, str] = {
+    int(entry["id"]): entry["name"]
+    for entry in _raw_digests
+    if entry.get("id") and entry.get("name")
+}  # channel_id -> channel_name
 
 # Per-channel state: {channel_id: {"session_id": uuid, "first_call": bool}}
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -145,7 +154,7 @@ def _ensure_log_files() -> None:
     container (which runs as UID 1001, sophie) can read via the read-only bind
     mount — the bot itself runs as root, so 600 would block her."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    for p in (INBOUND_LOG, OUTBOUND_LOG, REACTIONS_LOG, HOWL_LOG):
+    for p in (INBOUND_LOG, OUTBOUND_LOG, REACTIONS_LOG, HOWL_LOG, DIGESTS_LOG):
         if not p.exists():
             p.touch(mode=0o644)
         try:
@@ -1185,6 +1194,22 @@ async def on_message(message: discord.Message):
             _consecutive_sophie_hops = 0
         # Fall through — Nick mentioning Sophie in #howl still hits her
         # normal handler below.
+
+    # Capture CunningBot digest channels for sophie-recent-digests.
+    if DIGEST_CHANNEL_MAP and message.channel.id in DIGEST_CHANNEL_MAP:
+        try:
+            _append_jsonl(DIGESTS_LOG, {
+                "ts": now_iso(),
+                "channel_id": int(message.channel.id),
+                "channel_name": DIGEST_CHANNEL_MAP[message.channel.id],
+                "message_id": int(message.id),
+                "author_id": int(message.author.id),
+                "author_name": message.author.display_name or message.author.name,
+                "is_bot": bool(message.author.bot),
+                "content": message.content,
+            })
+        except Exception:
+            log.exception("on_message: failed to log digest traffic")
 
     if not message_is_from_nick_in_allowed_place(message):
         return

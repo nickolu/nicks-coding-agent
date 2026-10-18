@@ -6,5 +6,14 @@
   "howl_task_rate_limit_sec": 300,
   "howl_max_consecutive_hops": 2,
   "timezone": "America/Los_Angeles",
-  "quiet_hours": "22:00-08:00"
+  "quiet_hours": "22:00-08:00",
+  "digest_channels": [
+    {"name": "music", "id": "REPLACE_WITH_MUSIC_CHANNEL_ID"},
+    {"name": "san-diego-subreddits", "id": "REPLACE_WITH_SD_SUBREDDITS_CHANNEL_ID"},
+    {"name": "san-diego-east-county", "id": "REPLACE_WITH_SD_EAST_COUNTY_CHANNEL_ID"},
+    {"name": "slam-diego-news", "id": "REPLACE_WITH_SLAM_DIEGO_NEWS_CHANNEL_ID"},
+    {"name": "developer-news-feed", "id": "REPLACE_WITH_DEV_NEWS_CHANNEL_ID"},
+    {"name": "3d-printing", "id": "REPLACE_WITH_3D_PRINTING_CHANNEL_ID"},
+    {"name": "finance", "id": "REPLACE_WITH_FINANCE_CHANNEL_ID"}
+  ]
 }
