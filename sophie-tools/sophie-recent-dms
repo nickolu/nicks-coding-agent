@@ -155,7 +155,13 @@ def main() -> int:
     if not inbound:
         parts.append("  (none)")
     for r in inbound:
-        parts.append(f"  {fmt_local(r['ts'])} — {r['content'][:240]}")
+        line = f"  {fmt_local(r['ts'])} — {r['content'][:240]}"
+        attachments = r.get("attachments") or []
+        for att_path in attachments:
+            # Remap host path to container path for Sophie's use.
+            container_path = att_path.replace("/home/sophie/notebook/", "/notebook/")
+            line += f"\n    [attachment: {container_path}]"
+        parts.append(line)
 
     if show_outbound:
         parts.append("")

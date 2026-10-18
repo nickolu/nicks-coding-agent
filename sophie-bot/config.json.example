@@ -7,6 +7,7 @@
   "howl_max_consecutive_hops": 2,
   "timezone": "America/Los_Angeles",
   "quiet_hours": "22:00-08:00",
+  "attachments_dir": "/home/sophie/notebook/attachments",
   "digest_channels": [
     {"name": "music", "id": "REPLACE_WITH_MUSIC_CHANNEL_ID"},
     {"name": "san-diego-subreddits", "id": "REPLACE_WITH_SD_SUBREDDITS_CHANNEL_ID"},
