@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Post a message to a Discord channel from Howl.
+
+Usage:
+  howl-post --channel <name|id> "message"
+  howl-post --channel howl --tag sophie "Look what I found"
+  echo "done" | howl-post --channel howl
+
+Channel names are resolved via HOWL_CHANNEL_<NAME> environment variables.
+For example, HOWL_CHANNEL_HOWL=1234567890 lets you use --channel howl.
+Bare numeric IDs are also accepted directly.
+
+Tag targets (--tag):
+  sophie   resolves SOPHIE_DISCORD_USER_ID
+  nick     resolves NICK_DISCORD_USER_ID
+  any env var name ending in _DISCORD_USER_ID is tried
+
+Rate limiting (loop safety):
+  At most one post per HOWL_POST_RATE_SEC seconds (default 60) per channel.
+  State persisted in ~/.claude/howl-post-ratelimit.json.
+"""
+import argparse
+import json
+import os
+import sys
+import socket
+import time
+from pathlib import Path
+
+SOCKET = "/run/claude-discord.sock"
+RATELIMIT_PATH = Path(os.environ.get("HOME", "/home/claude")) / ".claude" / "howl-post-ratelimit.json"
+DEFAULT_RATE_SEC = 60
+
+
+def resolve_channel(name: str) -> str:
+    """Return a numeric channel ID given a name or bare ID."""
+    if name.isdigit():
+        return name
+    # Look for HOWL_CHANNEL_<NAME> env var (case-insensitive name match)
+    env_key = f"HOWL_CHANNEL_{name.upper()}"
+    val = os.environ.get(env_key, "").strip()
+    if val and val.isdigit():
+        return val
+    return name  # return as-is; the bot will fall back to DM if invalid
+
+
+def resolve_tag(target: str) -> str:
+    """Return a Discord @mention string for the given tag target, or empty string."""
+    if not target:
+        return ""
+    # Direct env var name?
+    if os.environ.get(target.upper(), "").strip().isdigit():
+        uid = os.environ[target.upper()].strip()
+        return f"<@{uid}>"
+    # Try <NAME>_DISCORD_USER_ID
+    env_key = f"{target.upper()}_DISCORD_USER_ID"
+    uid = os.environ.get(env_key, "").strip()
+    if uid and uid.isdigit():
+        return f"<@{uid}>"
+    return ""
+
+
+def load_ratelimit() -> dict:
+    try:
+        return json.loads(RATELIMIT_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def save_ratelimit(state: dict) -> None:
+    try:
+        RATELIMIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        RATELIMIT_PATH.write_text(json.dumps(state))
+    except Exception:
+        pass
+
+
+def check_ratelimit(channel_id: str, rate_sec: int) -> tuple[bool, float]:
+    """Return (allowed, wait_seconds). allowed=True means the post may proceed."""
+    state = load_ratelimit()
+    last = state.get(channel_id, 0.0)
+    elapsed = time.time() - last
+    if elapsed < rate_sec:
+        return False, rate_sec - elapsed
+    return True, 0.0
+
+
+def record_post(channel_id: str) -> None:
+    state = load_ratelimit()
+    state[channel_id] = time.time()
+    save_ratelimit(state)
+
+
+def send(payload_or_text) -> None:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(SOCKET)
+    if isinstance(payload_or_text, dict):
+        s.sendall(json.dumps(payload_or_text).encode("utf-8"))
+    else:
+        s.sendall(payload_or_text.encode("utf-8"))
+    s.shutdown(socket.SHUT_WR)
+    # Drain ack
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+    s.close()
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--channel", "-c",
+        default="",
+        metavar="NAME_OR_ID",
+        help="Channel name (resolved via HOWL_CHANNEL_<NAME> env) or numeric ID.",
+    )
+    p.add_argument(
+        "--tag", "-t",
+        default="",
+        metavar="USER",
+        help="@-mention a user: 'sophie', 'nick', or any env-var name.",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip rate-limit check (use sparingly).",
+    )
+    p.add_argument("message", nargs="*", help="Message text. Falls back to stdin if omitted.")
+    args = p.parse_args()
+
+    msg = " ".join(args.message).strip() if args.message else sys.stdin.read().strip()
+    if not msg:
+        return 0
+
+    channel_id = resolve_channel(args.channel) if args.channel else ""
+    tag_str = resolve_tag(args.tag) if args.tag else ""
+
+    if tag_str:
+        msg = f"{tag_str} {msg}"
+
+    # Rate-limit check (skip for DMs — they're intentional)
+    rate_sec = int(os.environ.get("HOWL_POST_RATE_SEC", DEFAULT_RATE_SEC))
+    if channel_id and not args.force:
+        allowed, wait = check_ratelimit(channel_id, rate_sec)
+        if not allowed:
+            print(
+                f"howl-post: rate limited — channel {channel_id!r} was posted to recently. "
+                f"Wait {wait:.0f}s or use --force.",
+                file=sys.stderr,
+            )
+            return 1
+
+    try:
+        if channel_id:
+            send({"type": "notify", "message": msg, "channel_id": channel_id})
+            record_post(channel_id)
+        else:
+            send(msg)
+    except FileNotFoundError:
+        print(f"howl-post: socket {SOCKET} not found", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"howl-post: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
