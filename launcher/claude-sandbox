@@ -22,6 +22,7 @@ DOCKER_ARGS=(
   -v "$CLAUDE_HOST/claude-notify:/usr/local/bin/claude-notify:ro"
   -v "$CLAUDE_HOST/claude-watch:/usr/local/bin/claude-watch:ro"
   -v "$CLAUDE_HOST/howl-post:/usr/local/bin/howl-post:ro"
+  -v "$CLAUDE_HOST/howl-session-report:/usr/local/bin/howl-session-report:ro"
   -v "$PROJECTS:/workspace"
   --env-file "$CLAUDE_HOST/.env"
   -e CLAUDE_CHANNEL_ID
