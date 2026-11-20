@@ -30,6 +30,8 @@ This README is the **file-to-host-path map** for actually deploying or restoring
 | `tools/claude-notify` | `/home/claude/.claude-container/claude-notify` (chmod +x) |
 | `tools/claude-watch` | `/home/claude/.claude-container/claude-watch` (chmod +x) |
 | `systemd/claude-discord.service` | `/etc/systemd/system/claude-discord.service` |
+| `tools/agent-auth-status` | `/usr/local/bin/agent-auth-status` (chmod +x) — cross-agent auth check |
+| `systemd/agent-auth-check.cron` | `/etc/cron.d/agent-auth-check` — daily auth check, pings #howl on trouble |
 
 ### Sophie
 
@@ -88,6 +90,52 @@ These live only on the host because they are secrets or runtime state:
 - `/home/calcifer/notebook/generated-images/` — image output (NPC portraits, locations)
 - per-session state in `/home/calcifer/.claude-container/{sessions,projects,cache,plans,…}/`
 - `/var/lib/calcifer-discord/sessions.json`
+
+## Claude auth — how it works and how to renew
+
+Each agent authenticates its `claude` CLI with a long-lived **subscription
+`setup-token`**, stored as `CLAUDE_CODE_OAUTH_TOKEN` in that agent's
+`.claude-container/.env` and passed into every container via `--env-file`. It's
+valid ~1 year. (An older `.credentials.json` OAuth file may also be present but
+is inert once the env token is set — the env var wins.)
+
+**Symptom of a dead token:** the agent replies `Failed to authenticate. API
+Error: 401`. Two distinct messages tell you *where* it's failing:
+`Invalid authentication credentials` = env var missing/unread (falling back to
+the creds file); `Invalid bearer token` = env var is read but the value is bad.
+
+**Renew (interactive — needs Nick's browser):**
+
+```sh
+ssh -t droplet /usr/local/bin/<agent>-sandbox shell   # claude- / sophie- / calcifer-
+# inside the container:
+claude setup-token          # paste the *browser code* at this prompt
+# it prints:  Your OAuth token (valid for 1 year): sk-ant-oat01-…
+# copy THAT line (starts with sk-ant-oat01-), then still inside the container:
+sed -i '/^CLAUDE_CODE_OAUTH_TOKEN=/d' /home/<user>/.claude/.env && \
+  read -rsp "paste token: " T && echo && \
+  case "$T" in sk-ant-oat01-*) \
+    printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$T" >> /home/<user>/.claude/.env && \
+    printf '%s\n' "$(date -u -d '+1 year' +%Y-%m-%d)" > /home/<user>/.claude/.claude-token-expiry && \
+    echo "appended ok (${#T} chars)";; \
+  *) echo "REJECTED: not the token — look for the sk-ant-oat01- line";; esac
+```
+
+`/home/<user>/.claude` inside the container **is** the host's
+`.claude-container` (bind-mounted), so this writes through to the host. No
+systemd restart needed — each call spawns a fresh `--rm` container that
+re-reads the file. Two easy mistakes, both guarded above: pasting the browser
+*authorization code* instead of the printed *token*, and a truncated copy — the
+`case` guard rejects anything not starting with `sk-ant-oat01-`.
+
+**Health check.** `agent-auth-status` (on the droplet, run as root) audits all
+agents — mechanism, expiry, and a live auth probe — and exits non-zero if any
+is broken or within 14 days of a recorded expiry. A daily cron
+(`/etc/cron.d/agent-auth-check`) runs it with `--alert`, which pings **#howl**
+on trouble, so a dead token surfaces same-day instead of whenever it's next
+used. The `.claude-token-expiry` sidecar (written by the renew command above)
+is what enables the *proactive* 14-day warning; without it an agent is still
+covered by the live probe, just not warned ahead of time.
 
 ## One-time setup for Sophie
 

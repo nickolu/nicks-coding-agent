@@ -27,3 +27,6 @@ calcifer-config/.credentials.json
 .DS_Store
 .idea/
 .vscode/
+
+# Claude Code local permissions (per-machine)
+.claude/settings.local.json

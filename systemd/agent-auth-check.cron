@@ -1,0 +1,9 @@
+# Daily auth health check for all agents (Howl, Sophie, Calcifer).
+# Runs the live probe + expiry check; pings #howl only if something is wrong.
+# Installed to /etc/cron.d/agent-auth-check by sync.sh.
+#
+# 09:15 UTC daily. Output is discarded on success (exit 0); on a problem the
+# alert goes to Discord, and cron mails root the table via MAILTO if set up.
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+15 9 * * * root /usr/local/bin/agent-auth-status --alert >/var/log/agent-auth-check.log 2>&1

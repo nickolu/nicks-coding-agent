@@ -70,6 +70,12 @@ install_file tools/claude-watch                       /home/claude/.claude-conta
 # systemd unit
 install_file systemd/claude-discord.service           /etc/systemd/system/claude-discord.service          root   root   0644
 
+# === Ops: cross-agent auth health check ===
+# Audits Howl/Sophie/Calcifer Claude auth daily and pings #howl on trouble.
+# Not gated on any agent user — it self-skips agents whose user doesn't exist.
+install_file tools/agent-auth-status                  /usr/local/bin/agent-auth-status                    root   root   0755
+install_file systemd/agent-auth-check.cron            /etc/cron.d/agent-auth-check                        root   root   0644
+
 # === Sophie (chief of staff / personal manager) ===
 # Only installed if the sophie OS user exists. This lets Howl-only droplets stay clean.
 if id sophie >/dev/null 2>&1; then

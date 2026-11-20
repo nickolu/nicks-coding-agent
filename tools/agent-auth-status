@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Audit Claude auth for every agent on the droplet (Howl, Sophie, Calcifer).
+
+For each agent whose OS user exists, report:
+  - auth mechanism: env `setup-token`, legacy creds file, or none
+  - expiry: from a `.claude-token-expiry` sidecar (env tokens are opaque) or,
+    when the creds file is the active auth, its embedded `expiresAt`
+  - live probe: actually run the agent's launcher and check it authenticates
+
+A "problem" is a failed/timed-out live probe, or an expiry within
+--threshold days (default 14). Exit status is non-zero if any agent has a
+problem, so this doubles as a cron health check.
+
+Usage (run on the droplet as root):
+  agent-auth-status                 # table for all agents, with live probe
+  agent-auth-status --no-probe      # static checks only (fast, no inference)
+  agent-auth-status --alert         # on any problem, ping #howl via the bridge
+  agent-auth-status --threshold 30  # widen the proactive expiry window
+
+Why a live probe rather than just reading expiry: env setup-tokens are opaque
+(`sk-ant-oat01-…`), so their real expiry can't be derived from the token. The
+probe is ground truth — it catches expiry, revocation, and stale refresh chains
+alike. The sidecar only adds *proactive* warning and is best-effort.
+"""
+import argparse
+import datetime
+import json
+import os
+import socket
+import subprocess
+import sys
+
+# (os_user, launcher basename in /usr/local/bin, human channel label)
+AGENTS = [
+    ("claude", "claude-sandbox", "#howl"),
+    ("sophie", "sophie-sandbox", "#sophie"),
+    ("calcifer", "calcifer-sandbox", "#calcifer"),
+]
+
+# Where alerts go. All agents' auth alerts land in the ops channel (#howl).
+ALERT_SOCKET = "/run/claude-discord.sock"
+
+PROBE_TIMEOUT = 90  # seconds; cold container start + one short inference
+PROBE_MARKER = "authok"
+AUTH_FAIL_SIGNS = ("401", "authentication", "invalid bearer", "failed to authenticate")
+
+
+def user_exists(user):
+    try:
+        import pwd
+
+        pwd.getpwnam(user)
+        return True
+    except KeyError:
+        return False
+
+
+def read_env_token_present(container_dir):
+    env = os.path.join(container_dir, ".env")
+    if not os.path.exists(env):
+        return False
+    try:
+        with open(env) as fh:
+            for line in fh:
+                if line.startswith("CLAUDE_CODE_OAUTH_TOKEN="):
+                    val = line.split("=", 1)[1].strip()
+                    return bool(val)
+    except OSError:
+        pass
+    return False
+
+
+def read_creds_expiry(container_dir):
+    """Return (datetime_utc, is_active_guess) or (None, False).
+
+    NOTE: the creds file's `expiresAt` is the short-lived *access-token* expiry
+    (rotates ~weekly) and is auto-refreshed by the CLI via the refresh token. A
+    past value is normal and does NOT mean auth is dead — only the live probe
+    can tell whether the refresh chain itself has gone stale. So this expiry is
+    shown for information but never drives an alert.
+    """
+    cred = os.path.join(container_dir, ".credentials.json")
+    if not os.path.exists(cred):
+        return None, False
+    try:
+        data = json.load(open(cred))
+    except (OSError, ValueError):
+        return None, False
+    obj = data.get("claudeAiOauth", data)
+    ms = obj.get("expiresAt")
+    if not isinstance(ms, (int, float)):
+        return None, False
+    return datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc), True
+
+
+def read_sidecar_expiry(container_dir):
+    """A `.claude-token-expiry` file holding one YYYY-MM-DD line, if present."""
+    path = os.path.join(container_dir, ".claude-token-expiry")
+    if not os.path.exists(path):
+        return None
+    try:
+        txt = open(path).read().strip()
+        d = datetime.datetime.strptime(txt, "%Y-%m-%d")
+        return d.replace(tzinfo=datetime.timezone.utc)
+    except (OSError, ValueError):
+        return None
+
+
+def live_probe(launcher):
+    """Run the agent's launcher and see if it authenticates.
+
+    Returns (ok: bool, detail: str).
+    """
+    path = os.path.join("/usr/local/bin", launcher)
+    if not os.path.exists(path):
+        return False, "launcher missing"
+    try:
+        proc = subprocess.run(
+            [path, "-p", f"reply with exactly: {PROBE_MARKER}"],
+            capture_output=True,
+            text=True,
+            timeout=PROBE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"probe timed out (>{PROBE_TIMEOUT}s)"
+    except OSError as e:
+        return False, f"probe error: {e}"
+    out = (proc.stdout + proc.stderr).lower()
+    if any(sign in out for sign in AUTH_FAIL_SIGNS):
+        return False, "auth rejected (401)"
+    if PROBE_MARKER in out:
+        return True, "ok"
+    if proc.returncode != 0:
+        return False, f"probe rc={proc.returncode}"
+    # Ran clean but didn't echo the marker — treat as soft-unknown, not failure.
+    return True, "ran (no marker echoed)"
+
+
+def days_until(dt, now):
+    return int((dt - now).total_seconds() // 86400)
+
+
+def send_alert(message):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(ALERT_SOCKET)
+        s.sendall(message.encode("utf-8"))
+        s.shutdown(socket.SHUT_WR)
+        s.recv(16)
+        s.close()
+        return True
+    except OSError as e:
+        print(f"alert failed: {e}", file=sys.stderr)
+        return False
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Audit agent Claude auth.")
+    ap.add_argument("--no-probe", action="store_true", help="skip the live auth probe")
+    ap.add_argument("--alert", action="store_true", help="ping #howl on any problem")
+    ap.add_argument("--threshold", type=int, default=14, help="proactive expiry-warning window in days")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    args = ap.parse_args()
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    rows = []
+    problems = []
+
+    for user, launcher, channel in AGENTS:
+        if not user_exists(user):
+            continue
+        container = f"/home/{user}/.claude-container"
+        env_token = read_env_token_present(container)
+        creds_exp, creds_active = read_creds_expiry(container)
+        sidecar_exp = read_sidecar_expiry(container)
+
+        # `exp`/`days` drive the proactive warning and come ONLY from the
+        # sidecar (a real ~1-year setup-token expiry). Creds-file expiresAt is
+        # displayed separately as info and never alerts — it rotates weekly.
+        if env_token:
+            mechanism = "env setup-token"
+            exp = sidecar_exp
+            exp_source = "sidecar" if sidecar_exp else None
+        elif creds_active:
+            mechanism = "creds file"
+            exp = sidecar_exp  # usually None for creds-file agents
+            exp_source = "sidecar" if sidecar_exp else None
+        else:
+            mechanism = "NONE"
+            exp = None
+            exp_source = None
+
+        days = days_until(exp, now) if exp else None
+        # Informational only — the access-token expiry, if we could read it.
+        access_exp = creds_exp.date().isoformat() if creds_exp else None
+
+        probe_ok, probe_detail = (None, "skipped")
+        if not args.no_probe:
+            probe_ok, probe_detail = live_probe(launcher)
+
+        # Decide problem state. Note: creds-file expiresAt is deliberately NOT
+        # a problem trigger — a stale refresh chain surfaces via the probe.
+        problem = None
+        if mechanism == "NONE":
+            problem = "no credentials configured"
+        elif probe_ok is False:
+            problem = f"live probe failed: {probe_detail}"
+        elif days is not None and days <= args.threshold:
+            problem = f"token expires in {days}d ({exp.date()})"
+
+        if problem:
+            problems.append((user, channel, problem))
+
+        rows.append(
+            {
+                "agent": user,
+                "channel": channel,
+                "mechanism": mechanism,
+                "expiry": exp.date().isoformat() if exp else None,
+                "expiry_source": exp_source,
+                "days_left": days,
+                "access_token_exp": access_exp,
+                "probe": probe_detail,
+                "probe_ok": probe_ok,
+                "problem": problem,
+            }
+        )
+
+    if args.json:
+        print(json.dumps({"checked_at": now.isoformat(), "rows": rows, "problems": bool(problems)}, indent=2))
+    else:
+        print(f"agent auth status @ {now.strftime('%Y-%m-%d %H:%M UTC')}")
+        print(f"{'agent':9} {'mechanism':16} {'token exp':12} {'days':>5}  {'probe':22} status")
+        print("-" * 78)
+        for r in rows:
+            exp = r["expiry"] or "-"
+            days = "-" if r["days_left"] is None else str(r["days_left"])
+            status = "PROBLEM: " + r["problem"] if r["problem"] else "ok"
+            print(f"{r['agent']:9} {r['mechanism']:16} {exp:12} {days:>5}  {r['probe']:22} {status}")
+        # Footnote any auto-refreshing access-token expiries (info, not alerts).
+        notes = [r for r in rows if r["access_token_exp"] and r["mechanism"] == "creds file"]
+        if notes:
+            print()
+            for r in notes:
+                print(f"note: {r['agent']} authenticates via creds-file refresh; "
+                      f"access-token exp {r['access_token_exp']} rotates automatically.")
+
+    if problems and args.alert:
+        lines = ["⚠️ **agent auth check**"]
+        for user, channel, prob in problems:
+            lines.append(f"• `{user}` ({channel}): {prob}")
+        lines.append("Renew: `ssh -t droplet /usr/local/bin/<agent>-sandbox shell` → `claude setup-token`")
+        send_alert("\n".join(lines))
+
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
