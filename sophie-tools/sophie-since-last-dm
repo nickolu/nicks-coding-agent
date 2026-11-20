@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Print minutes elapsed since Nick's most recent inbound DM.
+
+Reads /var/lib/sophie-discord/inbound-messages.jsonl.
+Exits 0 and prints an integer (minutes). If no DMs are on record, prints -1.
+
+Usage:
+  sophie-since-last-dm            # prints integer minutes, e.g. "12"
+  sophie-since-last-dm --format json  # {"minutes": 12, "last_dm_utc": "..."}
+
+Useful as a lightweight "is Nick active?" check before Sophie decides to
+send a proactive message, or as input to scheduling logic:
+  minutes=$(sophie-since-last-dm)
+  if [ "$minutes" -gt 60 ]; then ...
+"""
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("SOPHIE_STATE_DIR", "/var/lib/sophie-discord"))
+INBOUND_LOG = STATE_DIR / "inbound-messages.jsonl"
+
+
+def parse_iso(s: str) -> datetime:
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--format", choices=("text", "json"), default="text")
+    args = p.parse_args()
+
+    last_ts: str | None = None
+
+    if INBOUND_LOG.exists():
+        for line in INBOUND_LOG.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+                ts = row.get("ts", "")
+                if ts:
+                    last_ts = ts  # keep the last (most recent) entry
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+    if last_ts is None:
+        if args.format == "json":
+            print(json.dumps({"minutes": -1, "last_dm_utc": None}))
+        else:
+            print(-1)
+        return 0
+
+    try:
+        last_dt = parse_iso(last_ts)
+        elapsed_sec = (datetime.now(tz=timezone.utc) - last_dt).total_seconds()
+        minutes = max(0, int(elapsed_sec / 60))
+    except Exception as e:
+        print(f"sophie-since-last-dm: could not parse timestamp {last_ts!r}: {e}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        print(json.dumps({"minutes": minutes, "last_dm_utc": last_ts}))
+    else:
+        print(minutes)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -14,6 +14,7 @@ Examples:
   sophie-recent-howl --since-last-task        # since most recent sophie-task-howl
   sophie-recent-howl --since 30m              # last 30 minutes
   sophie-recent-howl --format json --since 1h
+  sophie-recent-howl --loop deploy            # only [Session: deploy] posts
 """
 from __future__ import annotations
 
@@ -101,6 +102,12 @@ def main() -> int:
     g.add_argument("--since-last-task", action="store_true",
                    help="Use the timestamp of the most recent sophie-task-howl. Falls back to 24h.")
     p.add_argument("--format", choices=("text", "json"), default="text")
+    p.add_argument(
+        "--loop",
+        metavar="NAME",
+        default="",
+        help="Filter to messages from howl-session-report for a specific session name.",
+    )
     args = p.parse_args()
 
     if args.since_last_task:
@@ -142,15 +149,20 @@ def main() -> int:
         })
     merged.sort(key=lambda x: x["ts"])
 
+    if args.loop:
+        prefix = f"[Session: {args.loop.strip()}]"
+        merged = [m for m in merged if prefix.lower() in m["content"].lower()]
+
     if args.format == "json":
-        print(json.dumps({
-            "since": since.isoformat(),
-            "messages": merged,
-        }, ensure_ascii=False, indent=2))
+        out = {"since": since.isoformat(), "messages": merged}
+        if args.loop:
+            out["loop"] = args.loop.strip()
+        print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
 
     parts = []
-    parts.append(f"#howl activity since {since.isoformat()} ({len(merged)} messages):")
+    loop_label = f" [loop={args.loop.strip()}]" if args.loop else ""
+    parts.append(f"#howl activity since {since.isoformat()}{loop_label} ({len(merged)} messages):")
     if not merged:
         parts.append("  (none)")
     else:

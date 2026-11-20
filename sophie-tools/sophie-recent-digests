@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Print recent CunningBot digest posts from watched channels.
+
+Reads /var/lib/sophie-discord/digests.jsonl — populated by the Sophie bridge
+whenever a message is posted in a configured digest channel (see
+digest_channels in config.json).
+
+Examples:
+  sophie-recent-digests                      # all channels, last 24h
+  sophie-recent-digests --channel music      # music channel only, last 24h
+  sophie-recent-digests --since 2h           # last 2 hours, all channels
+  sophie-recent-digests --since 6h --channel developer-news-feed
+  sophie-recent-digests --format json        # machine-readable
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("SOPHIE_STATE_DIR", "/var/lib/sophie-discord"))
+DIGESTS_LOG = STATE_DIR / "digests.jsonl"
+
+
+def parse_since(s: str) -> datetime:
+    s = s.strip()
+    m = re.fullmatch(r"(\d+)\s*([mhd])", s)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        delta = {"m": timedelta(minutes=n), "h": timedelta(hours=n), "d": timedelta(days=n)}[unit]
+        return datetime.now(tz=timezone.utc) - delta
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def filter_by_time(rows: list[dict], since: datetime) -> list[dict]:
+    out = []
+    for r in rows:
+        try:
+            ts = parse_since(r["ts"])
+        except Exception:
+            continue
+        if ts >= since:
+            out.append(r)
+    return out
+
+
+def fmt_local(ts_iso: str) -> str:
+    try:
+        dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        return dt.astimezone().strftime("%H:%M")
+    except Exception:
+        return ts_iso
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--channel", "-c",
+        default="",
+        metavar="NAME",
+        help="Filter to a specific channel name (e.g. 'music', 'finance').",
+    )
+    p.add_argument(
+        "--since",
+        default="",
+        help="ISO 8601 or relative (e.g. 30m, 2h, 1d). Default: 24h.",
+    )
+    p.add_argument("--format", choices=("text", "json"), default="text")
+    args = p.parse_args()
+
+    if args.since:
+        try:
+            since = parse_since(args.since)
+        except Exception as e:
+            print(f"sophie-recent-digests: bad --since {args.since!r}: {e}", file=sys.stderr)
+            return 2
+    else:
+        since = datetime.now(tz=timezone.utc) - timedelta(hours=24)
+
+    rows = filter_by_time(read_jsonl(DIGESTS_LOG), since)
+
+    if args.channel:
+        rows = [r for r in rows if r.get("channel_name", "").lower() == args.channel.lower()]
+
+    rows.sort(key=lambda x: x["ts"])
+
+    if args.format == "json":
+        out: dict = {"since": since.isoformat(), "messages": rows}
+        if args.channel:
+            out["channel"] = args.channel
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+
+    channel_label = f" [#{args.channel}]" if args.channel else ""
+    print(f"Digest activity since {since.isoformat()}{channel_label} ({len(rows)} messages):")
+    if not rows:
+        print("  (none)")
+        return 0
+
+    channel_w = max((len(r.get("channel_name", "")) for r in rows), default=8)
+    author_w = max((len(r.get("author_name", "")) for r in rows), default=6)
+    for r in rows:
+        ch = r.get("channel_name", "?")
+        author = r.get("author_name", "?")
+        content = " ".join(r.get("content", "").split())
+        print(f"  {fmt_local(r['ts'])}  #{ch:<{channel_w}}  {author:<{author_w}}  — {content[:240]}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

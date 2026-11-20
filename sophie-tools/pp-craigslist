@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Search Craigslist listings via RSS feeds (no auth, no scraping).
+
+Craigslist exposes public RSS feeds that are more stable than HTML scraping.
+This tool queries those feeds and returns results in a readable format.
+
+Usage:
+  pp-craigslist "bicycle"
+  pp-craigslist --region sandiego --category sss "standing desk"
+  pp-craigslist --region sfbay --category hhh "1br apartment" --limit 10
+  pp-craigslist --region sandiego "kayak" --format json
+
+Common regions (subdomain):
+  sandiego  sfbay  losangeles  newyork  seattle  portland  denver  austin
+  chicago   boston  miami  atlanta  phoenix  dallas  houston  minneapolis
+
+Common category codes:
+  sss   for sale (all)         cta   cars & trucks
+  hhh   housing (all)          ele   electronics
+  ggg   gigs                   fuo   furniture
+  jjj   jobs                   bab   baby & kid stuff
+  ccc   community              tls   tools
+  sfc   services               boo   books
+  ata   antiques               mca   motorcycles
+
+Flags:
+  --region CODE    Craigslist city subdomain (default: sandiego)
+  --category CODE  Category code (default: sss — all for sale)
+  --limit N        Max results to show (default: 10)
+  --format json    Machine-readable output
+
+NOTE: Craigslist actively blocks crawlers — RSS feeds are the most reliable
+access path but may still fail for some regions/categories or get blocked.
+If this returns no results, the feed may be temporarily unavailable.
+"""
+import argparse
+import json
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+
+USER_AGENT = "nicks-coding-agent/1.0 (personal assistant; rss reader)"
+RSS_URL = "https://{region}.craigslist.org/search/{category}.rss?query={query}&sort=date"
+
+# Namespaces used in Craigslist RSS
+NS = {
+    "cl": "http://www.craigslist.org/about/cl-rss-extension",
+    "geo": "http://www.w3.org/2003/01/geo/wgs84_pos#",
+}
+
+
+def fetch_rss(url: str) -> str:
+    req = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept": "application/rss+xml, application/xml, text/xml",
+    })
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def parse_price(item: ET.Element) -> str:
+    # Try the <cl:price> element
+    price_el = item.find("cl:price", NS)
+    if price_el is not None and price_el.text:
+        return price_el.text.strip()
+    # Fall back to scanning description for $NNN
+    desc = (item.findtext("description") or "")
+    m = re.search(r"\$[\d,]+", desc)
+    return m.group(0) if m else ""
+
+
+def parse_items(xml_text: str, limit: int) -> list[dict]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        raise ValueError(f"Failed to parse RSS: {e}") from e
+
+    channel = root.find("channel")
+    if channel is None:
+        return []
+
+    results = []
+    for item in channel.findall("item")[:limit]:
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        price = parse_price(item)
+        desc = re.sub(r"<[^>]+>", "", item.findtext("description") or "").strip()
+        desc = re.sub(r"\s+", " ", desc)[:200]
+        results.append({
+            "title": title,
+            "price": price,
+            "date": pub_date,
+            "url": link,
+            "description": desc,
+        })
+    return results
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("query", nargs="+", help="Search terms.")
+    p.add_argument("--region", default="sandiego", metavar="CODE",
+                   help="Craigslist city subdomain (default: sandiego).")
+    p.add_argument("--category", default="sss", metavar="CODE",
+                   help="Category code (default: sss — all for sale).")
+    p.add_argument("--limit", type=int, default=10, metavar="N",
+                   help="Max results (default: 10).")
+    p.add_argument("--format", choices=("text", "json"), default="text")
+    args = p.parse_args()
+
+    query = " ".join(args.query).strip()
+    region = args.region.strip().lower()
+    category = args.category.strip().lower()
+    url = RSS_URL.format(
+        region=region,
+        category=category,
+        query=urllib.parse.quote(query),
+    )
+
+    try:
+        xml_text = fetch_rss(url)
+    except urllib.error.HTTPError as e:
+        print(
+            f"pp-craigslist: HTTP {e.code} fetching {region}/{category} — "
+            f"this region/category may not exist or Craigslist is blocking the request.",
+            file=sys.stderr,
+        )
+        return 1
+    except urllib.error.URLError as e:
+        print(f"pp-craigslist: network error — {e.reason}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"pp-craigslist: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        items = parse_items(xml_text, args.limit)
+    except ValueError as e:
+        print(f"pp-craigslist: {e}", file=sys.stderr)
+        return 1
+
+    if not items:
+        print(f"pp-craigslist: no results for {query!r} in {region}/{category}", file=sys.stderr)
+        return 0
+
+    if args.format == "json":
+        print(json.dumps({
+            "region": region,
+            "category": category,
+            "query": query,
+            "results": items,
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"Craigslist {region}/{category} — {query!r} ({len(items)} results):\n")
+    for i, item in enumerate(items, 1):
+        price_str = f"  {item['price']}" if item["price"] else ""
+        print(f"{i:2}. {item['title']}{price_str}")
+        if item["description"]:
+            print(f"    {item['description']}")
+        print(f"    {item['url']}")
+        if item["date"]:
+            print(f"    Posted: {item['date']}")
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
