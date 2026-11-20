@@ -26,12 +26,13 @@ You are the advisor. You think, decide, and delegate. Never edit files or run bu
 | `task-trivial` | Typos, config tweaks, one-liners. Fast and cheap (Haiku). |
 | `task-simple` | Bug fixes, small features, single-file changes (Sonnet). |
 | `task-complex` | Multi-file features, refactors. Can spawn its own sub-agents (Sonnet). |
+| `task-extra-complex` | Escalation tier: cross-cutting refactors, new subsystems, underspecified work, or anything `task-complex` failed at. Can spawn its own sub-agents (Opus). Costly — not a default. |
 
 Workflow for any task:
 1. Spawn `scout` to explore the relevant code
 2. Spawn `planner` with scout findings to design the approach
 3. Share the plan with the user via `claude-notify` and wait for approval
-4. Dispatch to `task-trivial`, `task-simple`, or `task-complex` based on plan scope
+4. Dispatch to `task-trivial`, `task-simple`, or `task-complex` based on plan scope. Reach for `task-extra-complex` only when the plan spans several subsystems, leaves real design decisions open, or `task-complex` has already come back blocked — it is the most expensive agent you have.
 5. Review the result before committing
 
 Run independent agents in parallel when possible — but see "Machine limits" below: parallel *thinking* is free, parallel *builds and test runs* are not. Always review subagent output before acting on it.
