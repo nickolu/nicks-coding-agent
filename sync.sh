@@ -66,6 +66,8 @@ install_dir_contents claude-config/agents             /home/claude/.claude-conta
 # Notify CLIs — bind-mounted into the container
 install_file tools/claude-notify                      /home/claude/.claude-container/claude-notify        claude claude 0755
 install_file tools/claude-watch                       /home/claude/.claude-container/claude-watch         claude claude 0755
+install_file tools/howl-post                          /home/claude/.claude-container/howl-post            claude claude 0755
+install_file tools/howl-session-report                /home/claude/.claude-container/howl-session-report  claude claude 0755
 
 # systemd unit
 install_file systemd/claude-discord.service           /etc/systemd/system/claude-discord.service          root   root   0644
@@ -92,6 +94,10 @@ if id sophie >/dev/null 2>&1; then
   install_file sophie-tools/sophie-schedule           /home/sophie/.claude-container/sophie-schedule      sophie sophie 0755
   install_file sophie-tools/sophie-recent-dms         /home/sophie/.claude-container/sophie-recent-dms    sophie sophie 0755
   install_file sophie-tools/sophie-recent-howl        /home/sophie/.claude-container/sophie-recent-howl   sophie sophie 0755
+  install_file sophie-tools/sophie-recent-digests     /home/sophie/.claude-container/sophie-recent-digests sophie sophie 0755
+  install_file sophie-tools/sophie-since-last-dm      /home/sophie/.claude-container/sophie-since-last-dm sophie sophie 0755
+  install_file sophie-tools/pp-craigslist             /home/sophie/.claude-container/pp-craigslist        sophie sophie 0755
+  install_file sophie-tools/pp-wikipedia              /home/sophie/.claude-container/pp-wikipedia         sophie sophie 0755
   install_file sophie-tools/sophie-task-howl          /home/sophie/.claude-container/sophie-task-howl     sophie sophie 0755
   install_file sophie-tools/sophie-await-howl-reply   /home/sophie/.claude-container/sophie-await-howl-reply sophie sophie 0755
   install_file sophie-tools/sophie-pulse-self         /home/sophie/.claude-container/sophie-pulse-self    sophie sophie 0755
