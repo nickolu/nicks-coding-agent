@@ -12,8 +12,19 @@ fi
 TTY_FLAGS=()
 if [ -t 0 ] && [ -t 1 ]; then TTY_FLAGS=(-it); fi
 
+# Resource caps — see launcher/claude-sandbox for the rationale. Same profile as
+# Sophie: light work, small RAM ceiling, default cpu-shares weight so Calcifer
+# stays responsive while Howl's builds yield.
+LIMIT_ARGS=(
+  --memory=512m
+  --memory-swap=768m
+  --cpu-shares=1024
+  --pids-limit=256
+)
+
 DOCKER_ARGS=(
   --rm "${TTY_FLAGS[@]}"
+  "${LIMIT_ARGS[@]}"
   --name "calcifer-sandbox-$$"
   --hostname calcifer-sandbox
   -e "TZ=${TZ:-UTC}"

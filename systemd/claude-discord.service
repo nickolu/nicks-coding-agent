@@ -18,6 +18,11 @@ ProtectSystem=strict
 ProtectHome=false
 ReadWritePaths=/var/lib/claude-discord /home/claude/.claude-container /run
 PrivateTmp=true
+# Survive host memory pressure. When an agent container balloons, the kernel
+# should reclaim from / kill the container — never the bridge that receives
+# Discord messages, since a dead bridge looks like "the agent stopped replying".
+OOMScoreAdjust=-500
+MemoryLow=64M
 
 [Install]
 WantedBy=multi-user.target

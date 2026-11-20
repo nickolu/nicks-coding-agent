@@ -12,8 +12,26 @@ fi
 TTY_FLAGS=()
 if [ -t 0 ] && [ -t 1 ]; then TTY_FLAGS=(-it); fi
 
+# Resource caps. The droplet is 1 vCPU / 2 GB, and Howl runs the heavy work
+# (typechecks, test suites), so an uncapped build can exhaust host RAM+swap and
+# take the other agents down with it. Caps keep a runaway build inside its own
+# cgroup: it gets OOM-killed alone instead of wedging the host.
+#   --memory/--memory-swap  hard RAM ceiling + a *bounded* swap margin. Unbounded
+#                           swap thrash on 1 core is what makes the box unreachable.
+#   --cpu-shares=512        half the default weight, so under contention the
+#                           interactive agents (Sophie, Calcifer) stay responsive
+#                           while Howl's builds yield. No cap when they're idle.
+#   --pids-limit            backstop against runaway worker pools / fork storms.
+LIMIT_ARGS=(
+  --memory=1024m
+  --memory-swap=1280m
+  --cpu-shares=512
+  --pids-limit=512
+)
+
 DOCKER_ARGS=(
   --rm "${TTY_FLAGS[@]}"
+  "${LIMIT_ARGS[@]}"
   --name "claude-sandbox-$$"
   --hostname claude-sandbox
   -v "$CLAUDE_HOST:/home/claude/.claude"

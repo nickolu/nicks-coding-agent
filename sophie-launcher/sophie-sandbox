@@ -18,8 +18,20 @@ if [ -t 0 ] && [ -t 1 ]; then TTY_FLAGS=(-it); fi
 mkdir -p "$SOPHIE_HOST/gws-config" "$SOPHIE_HOST/keyrings"
 chown sophie:sophie "$SOPHIE_HOST/gws-config" "$SOPHIE_HOST/keyrings"
 
+# Resource caps — see launcher/claude-sandbox for the rationale. Sophie does
+# light work (notebook, CLI calls), so she gets a smaller RAM ceiling than Howl
+# but keeps the *default* cpu-shares weight: when Howl's builds are hammering
+# the single vCPU, Sophie should still win enough CPU to answer a DM.
+LIMIT_ARGS=(
+  --memory=512m
+  --memory-swap=768m
+  --cpu-shares=1024
+  --pids-limit=256
+)
+
 DOCKER_ARGS=(
   --rm "${TTY_FLAGS[@]}"
+  "${LIMIT_ARGS[@]}"
   --name "sophie-sandbox-$$"
   --hostname sophie-sandbox
   -e "TZ=${TZ:-UTC}"

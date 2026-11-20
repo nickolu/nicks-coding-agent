@@ -18,6 +18,9 @@ ProtectSystem=strict
 ProtectHome=false
 ReadWritePaths=/var/lib/calcifer-discord /home/calcifer/.claude-container /run
 PrivateTmp=true
+# Survive host memory pressure — see systemd/claude-discord.service.
+OOMScoreAdjust=-500
+MemoryLow=64M
 
 [Install]
 WantedBy=multi-user.target

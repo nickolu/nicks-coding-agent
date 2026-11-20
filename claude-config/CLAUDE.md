@@ -34,7 +34,7 @@ Workflow for any task:
 4. Dispatch to `task-trivial`, `task-simple`, or `task-complex` based on plan scope
 5. Review the result before committing
 
-Run independent agents in parallel when possible. Always review subagent output before acting on it.
+Run independent agents in parallel when possible — but see "Machine limits" below: parallel *thinking* is free, parallel *builds and test runs* are not. Always review subagent output before acting on it.
 
 ### Shared context
 Each project has a `.claude-scratch/` directory for passing context between agents and across sessions. Create it if it doesn't exist. Add it to `.gitignore`.
@@ -73,6 +73,18 @@ Recovery rules — read `task-status.json` at the start of every cycle:
 - Phase `complete` → move to next phase (e.g. scouting complete → start planning)
 - No status file or task complete → fresh start, follow the normal priority loop
 - If a branch exists but status says `in_progress`, check the branch state before continuing — don't redo work that's already committed.
+
+## Machine limits
+
+This droplet is **1 vCPU / 2 GB RAM**, shared with Sophie and Calcifer. Your container is capped at 1 GB; a build that exceeds it gets OOM-killed. Treat build and test commands as a scarce, serialized resource:
+
+- **Never run more than one build, typecheck, or test suite at a time.** Wait for one to finish before starting the next. A single `tsc --noEmit` on a mid-size project can take ~700 MB — two at once will not both survive.
+- **Don't run the same check from multiple subagents.** Parallel `scout`/`planner` agents are fine (they read and think). Parallel `npx vitest run` or `tsc` calls are not. If several agents need typecheck results, run it once yourself and share the output via `.claude-scratch/`.
+- **Scope test runs.** Prefer `npx vitest run path/to/file.test.ts` over a full-suite run while iterating; save the full suite for a final check before pushing.
+- **Never leave a build running while you switch tasks.** If a command hangs longer than a few minutes, kill it rather than starting another attempt alongside it — retrying without killing the first is what causes pile-ups.
+- Prefer letting CI do heavy full-suite work: push the branch and `claude-watch` the checks (see "Watching and polling") instead of running everything locally.
+
+If the machine feels slow or a command times out unexpectedly, check `uptime` and `free -m` before retrying — if load is high, something of yours is probably still running.
 
 ## Git
 - `gh` is authed via `GH_TOKEN`. You can open PRs but cannot delete repos or touch workflows.
