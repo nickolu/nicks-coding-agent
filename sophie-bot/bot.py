@@ -26,6 +26,8 @@ from zoneinfo import ZoneInfo
 
 import discord
 
+import sched_time  # sibling module in /opt/sophie-discord (installed by sync.sh)
+
 CONFIG_PATH = Path("/etc/sophie-discord/config.json")
 STATE_DIR = Path("/var/lib/sophie-discord")
 STATE_PATH = STATE_DIR / "sessions.json"
@@ -353,29 +355,61 @@ def split_discord(text: str, limit: int = 1900) -> list[str]:
 
 # --- Watcher / reminder system ---
 
-async def run_check_command(command: str) -> str:
-    """Run a check command inside an ephemeral Sophie sandbox container.
+SANDBOX_EXEC_TIMEOUT_RC = 124  # GNU timeout(1) exit status; also used for our own outer timeout
 
-    Mounts /home/sophie/notebook -> /notebook so commands can reference the
-    same paths Sophie uses inside her main container.
+
+async def run_sandbox_exec(command: str, timeout: int = 120) -> tuple[int, str, str]:
+    """Run `bash -c <command>` in an ephemeral Sophie sandbox container.
+
+    Goes through `sophie-sandbox exec`, so the container gets exactly the
+    launcher's mount set (gws config + keyring, every sophie-* tool, the
+    notebook, the notify socket, TZ, .env). The bot never duplicates that list.
+
+    The command is wrapped in `timeout -k 5 <timeout>` *inside* the container
+    so a hung check exits (and the --rm container is reaped) instead of
+    lingering after we give up on the client process. The outer subprocess
+    timeout is a backstop for a hung docker client.
+
+    Returns (returncode, stdout, stderr). A timeout returns
+    (SANDBOX_EXEC_TIMEOUT_RC, "", "timed out after <N>s"). Other failures
+    (docker missing, launcher unreadable) raise.
+
+    SOPHIE_AUTONOMY is deliberately left unset: these are check/helper runs,
+    not autonomy ticks.
     """
-    args = [
-        "docker", "run", "--rm",
-        "-v", "/home/sophie/notebook:/notebook",
-        "-w", "/notebook",
-        "--env-file", "/home/sophie/.claude-container/.env",
-        "sophie-sandbox:latest",
-        "bash", "-c", command,
-    ]
+    args = [SOPHIE_CMD, "exec", "timeout", "-k", "5", str(timeout), "bash", "-c", command]
+
     def _run():
+        env = os.environ.copy()
+        env["TZ"] = TIMEZONE.key
+        env.pop("SOPHIE_AUTONOMY", None)
         try:
-            r = subprocess.run(args, capture_output=True, text=True, timeout=120)
-            return r.stdout.strip() + r.stderr.strip()
+            r = subprocess.run(
+                args, capture_output=True, text=True, timeout=timeout + 30, env=env,
+            )
         except subprocess.TimeoutExpired:
-            return "[check command timed out]"
-        except Exception as e:
-            return f"[check error: {e}]"
+            return SANDBOX_EXEC_TIMEOUT_RC, "", f"timed out after {timeout}s"
+        if r.returncode == SANDBOX_EXEC_TIMEOUT_RC:
+            return SANDBOX_EXEC_TIMEOUT_RC, r.stdout, f"timed out after {timeout}s"
+        return r.returncode, r.stdout, r.stderr
+
     return await asyncio.to_thread(_run)
+
+
+async def run_check_command(command: str) -> str:
+    """Run a watcher check command in the sandbox and return stdout+stderr as one string.
+
+    Same string contract as before (callers `--match` against it): stdout and
+    stderr are stripped and concatenated; timeouts and launch errors come back
+    as the bracketed sentinel strings.
+    """
+    try:
+        rc, out, err = await run_sandbox_exec(command, timeout=120)
+    except Exception as e:
+        return f"[check error: {e}]"
+    if rc == SANDBOX_EXEC_TIMEOUT_RC:
+        return "[check command timed out]"
+    return out.strip() + err.strip()
 
 
 async def send_dm(msg: str, *, tag: str = "", reactions: list[str] | None = None):
@@ -699,13 +733,7 @@ def now_utc() -> datetime:
 
 def parse_iso_aware(s: str) -> datetime:
     """Parse an ISO 8601 timestamp; naive values are assumed in the user's TZ."""
-    s = s.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=TIMEZONE)
-    return dt.astimezone(timezone.utc)
+    return sched_time.parse_iso_aware(s, TIMEZONE)
 
 
 def format_local(dt_utc_iso: str) -> str:
@@ -805,39 +833,29 @@ def record_unsolicited_dm():
         )
 
 
-def compute_next_fire(s: dict) -> datetime | None:
-    rec = s.get("recurrence")
-    if not rec:
-        return None
-    fired_at = parse_iso_aware(s["fire_at_utc"])
-    if rec == "daily":
-        return fired_at + timedelta(days=1)
-    if rec == "weekly":
-        return fired_at + timedelta(days=7)
-    if rec.startswith("every:"):
-        spec = rec[len("every:"):]
-        unit = spec[-1]
-        try:
-            n = int(spec[:-1])
-        except ValueError:
-            log.warning(f"bad recurrence spec {rec!r}")
-            return None
-        if unit == "m":
-            return fired_at + timedelta(minutes=n)
-        if unit == "h":
-            return fired_at + timedelta(hours=n)
-        if unit == "d":
-            return fired_at + timedelta(days=n)
-    log.warning(f"unknown recurrence {rec!r}")
-    return None
+def advance_recurring(s: dict, now: datetime) -> bool:
+    """Move a recurring schedule to its next fire strictly after `now`; False if one-shot.
+
+    Day-based recurrences keep their local wall-clock time across DST and
+    quiet-hours deferral (see sched_time.py for the `nominal_local` anchor).
+    A malformed spec is logged and treated as one-shot, i.e. the schedule is
+    dropped, which matches the previous behavior.
+    """
+    try:
+        return sched_time.advance_schedule(s, TIMEZONE, now)
+    except ValueError as e:
+        log.warning(f"schedule {s.get('id', '?')[:8]} {e}; dropping")
+        return False
 
 
 async def is_calendar_busy_now() -> bool:
     """Return True iff Nick has a calendar event covering this instant.
 
     Uses `gws calendar freebusy query` against his primary calendar via an
-    ephemeral Sophie sandbox container. Spends ~1-2s on docker startup per
-    call — acceptable for a per-fire check, not for hot-path use.
+    ephemeral Sophie sandbox container (run_check_command, which since the
+    `sophie-sandbox exec` change mounts the gws config and keyring, so this
+    can actually succeed). Spends ~1-2s on docker startup per call —
+    acceptable for a per-fire check, not for hot-path use.
 
     Any failure (gws not authed, no network, parse error) returns False so
     `skip_if_busy` errs on the side of firing the reminder rather than
@@ -956,14 +974,8 @@ async def scheduler_tick():
             asyncio.create_task(fire_schedule(s))
             changed = True
 
-        next_fire = compute_next_fire(s)
-        if next_fire:
-            # advance until strictly in the future to avoid rapid re-fires
-            while next_fire <= now:
-                s["fire_at_utc"] = next_fire.isoformat()
-                bumped = compute_next_fire(s)
-                next_fire = bumped if bumped else (next_fire + timedelta(days=1))
-            s["fire_at_utc"] = next_fire.isoformat()
+        # Recurring: advance (strictly into the future, wall-clock safe) and keep.
+        if advance_recurring(s, now):
             remaining.append(s)
 
     if changed:
@@ -1009,13 +1021,7 @@ def run_missed_fires_on_startup():
         if not s.get("pause_when_off"):
             desc = s.get("description") or s.get("message") or s.get("prompt", "")[:60]
             missed_notes.append(f"`{s['id'][:8]}` ({desc[:80]}) — was due {format_local(s['fire_at_utc'])}")
-        next_fire = compute_next_fire(s)
-        if next_fire:
-            while next_fire <= now:
-                s["fire_at_utc"] = next_fire.isoformat()
-                bumped = compute_next_fire(s)
-                next_fire = bumped if bumped else (next_fire + timedelta(days=1))
-            s["fire_at_utc"] = next_fire.isoformat()
+        if advance_recurring(s, now):
             remaining.append(s)
         changed = True
 
@@ -1031,19 +1037,11 @@ def run_missed_fires_on_startup():
 # --- Schedule add/list/cancel (called from socket and Discord) ---
 
 def _validate_recurrence(rec: str | None) -> str | None:
+    """Return the spec unchanged if valid, None if empty; raises ValueError (user-facing message)."""
     if not rec:
         return None
-    if rec in ("daily", "weekly"):
-        return rec
-    if rec.startswith("every:"):
-        spec = rec[len("every:"):]
-        if len(spec) >= 2 and spec[-1] in "mhd":
-            try:
-                int(spec[:-1])
-                return rec
-            except ValueError:
-                pass
-    raise ValueError(f"recurrence must be 'daily', 'weekly', or 'every:Nm|Nh|Nd' (got {rec!r})")
+    sched_time.parse_recurrence(rec)
+    return rec
 
 
 def schedule_add(payload: dict) -> str:
@@ -1089,6 +1087,9 @@ def schedule_add(payload: dict) -> str:
         "kind": kind,
         "fire_at_utc": fire_at.isoformat(),
         "recurrence": rec,
+        # Local wall-clock anchor for recurring schedules (DST + deferral safe);
+        # see sched_time.py. Ignored by older code, so safe to roll back.
+        "nominal_local": sched_time.local_naive_iso(fire_at, TIMEZONE) if rec else None,
         "message": payload.get("message", ""),
         "prompt": payload.get("prompt", ""),
         "session_id": payload.get("session_id") or None,

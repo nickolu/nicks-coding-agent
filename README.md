@@ -332,11 +332,26 @@ sudo ./sync.sh         # apply
 owner/perms, then conditionally:
 
 - restarts `claude-discord` if Howl's `bot.py` or systemd unit changed
-- restarts `sophie-discord` if Sophie's `bot.py` or systemd unit changed
+- restarts `sophie-discord` if Sophie's `bot.py`, a sibling module in
+  `sophie-bot/` (e.g. `sched_time.py`), or the systemd unit changed
 - runs `systemctl daemon-reload` if any systemd unit changed
 - prints a reminder to rebuild the relevant Docker image if a Dockerfile changed
 
 Re-running with no upstream changes is a no-op.
+
+## Running tests
+
+Pure logic that the bots depend on (currently `sophie-bot/sched_time.py`,
+the DST-safe recurrence math) lives in small modules next to `bot.py` and is
+covered by pytest in `tests/`. Run them on your laptop, never on the droplet:
+
+```sh
+python3 -m pytest tests/ -q
+```
+
+`tests/conftest.py` puts `sophie-bot/` on `sys.path`. Do not import `bot.py`
+itself in a test: it reads `/etc/sophie-discord/config.json` and imports
+`discord` at import time.
 
 ## Pulling ad-hoc changes back from the droplet
 

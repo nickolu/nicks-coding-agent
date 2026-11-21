@@ -63,6 +63,10 @@ DOCKER_ARGS=(
 )
 
 case "$1" in
+  # exec: run an arbitrary command with the identical mount set. Used by the
+  # bot (run_sandbox_exec) for watcher checks and gws calls, so there is one
+  # mount list, here. No TTY is allocated when stdin/stdout are not terminals.
+  exec)  shift; exec docker run "${DOCKER_ARGS[@]}" "$@" ;;
   shell) exec docker run "${DOCKER_ARGS[@]}" bash ;;
   -p)    shift; exec docker run "${DOCKER_ARGS[@]}" claude --dangerously-skip-permissions -p "$@" ;;
   *)     exec docker run "${DOCKER_ARGS[@]}" claude --dangerously-skip-permissions "$@" ;;
