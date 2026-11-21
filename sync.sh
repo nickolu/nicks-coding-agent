@@ -82,6 +82,7 @@ install_file systemd/agent-auth-check.cron            /etc/cron.d/agent-auth-che
 # Only installed if the sophie OS user exists. This lets Howl-only droplets stay clean.
 if id sophie >/dev/null 2>&1; then
   install_file sophie-bot/bot.py                      /opt/sophie-discord/bot.py                          root   root   0755
+  install_file sophie-bot/sched_time.py               /opt/sophie-discord/sched_time.py                   root   root   0644
   install_file sophie-launcher/sophie-sandbox         /usr/local/bin/sophie-sandbox                       root   root   0755
   install_file sophie-sandbox/Dockerfile              /home/sophie/sandbox/Dockerfile                     sophie sophie 0644
   install_file sophie-config/settings.json            /home/sophie/.claude-container/settings.json        sophie sophie 0644
@@ -141,6 +142,7 @@ for path in "${CHANGED[@]:-}"; do
     /etc/systemd/system/claude-discord.service)     reload_systemd=1; restart_bot=1 ;;
     /home/claude/sandbox/Dockerfile)                warn_dockerfile=1 ;;
     /opt/sophie-discord/bot.py)                     restart_sophie=1 ;;
+    /opt/sophie-discord/sched_time.py)              restart_sophie=1 ;;
     /etc/systemd/system/sophie-discord.service)     reload_systemd=1; restart_sophie=1 ;;
     /home/sophie/sandbox/Dockerfile)                warn_sophie_dockerfile=1 ;;
     /opt/calcifer-discord/bot.py)                   restart_calcifer=1 ;;

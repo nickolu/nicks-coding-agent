@@ -19,6 +19,7 @@ calcifer-config/.credentials.json
 **/plans/
 **/backups/
 **/__pycache__/
+.pytest_cache/
 **/venv/
 *.log
 *.pyc
