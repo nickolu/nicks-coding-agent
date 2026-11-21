@@ -965,6 +965,9 @@ async def scheduler_tick():
                 log.info(f"schedule {s['id'][:8]} deferred to {deferred_until}")
 
         if deferred_until:
+            # Pin the intended wall clock before overwriting fire_at_utc, or the
+            # deferred time would become the recurrence anchor (the old bug).
+            sched_time.ensure_anchor(s, TIMEZONE)
             s["fire_at_utc"] = deferred_until.isoformat()
             remaining.append(s)
             changed = True
@@ -994,6 +997,45 @@ async def scheduler_loop():
         except Exception:
             log.exception("scheduler_tick errored")
         await asyncio.sleep(SCHEDULER_TICK_SEC)
+
+
+def anchor_legacy_schedules():
+    """One-time migration-in-place: give pre-anchor recurring schedules a `nominal_local`.
+
+    The anchor is taken from the current fire_at_utc. For a schedule that was
+    *already* sitting in a quiet-hours deferral when the bot restarted, the
+    intended time is unrecoverable (the old code overwrote it); we can only
+    recognize the likely case (defer_if_quiet set, fire time exactly at the
+    quiet-window end) and warn so Nick can recreate it. Logs every anchor it
+    writes so the deploy check can compare against the previous listing.
+    """
+    qh = get_quiet_hours()
+    changed = False
+    for s in SCHEDULES:
+        if not s.get("recurrence") or s.get("nominal_local"):
+            continue
+        try:
+            local = parse_iso_aware(s["fire_at_utc"]).astimezone(TIMEZONE)
+        except Exception:
+            continue  # run_missed_fires_on_startup drops bad fire_at entries
+        sid = s.get("id", "?")[:8]
+        suspicious = (
+            qh is not None
+            and s.get("defer_if_quiet")
+            and (local.hour, local.minute) == (qh[2], qh[3])
+        )
+        if sched_time.ensure_anchor(s, TIMEZONE):
+            changed = True
+            if suspicious:
+                log.warning(
+                    f"schedule {sid} anchored at {local.strftime('%H:%M %Z')} which is exactly the "
+                    f"quiet-hours end; if this reminder was deferred, its original time is lost. "
+                    f"Recreate it if the hour is wrong ({s.get('description', '')[:60]!r})."
+                )
+            else:
+                log.info(f"schedule {sid} anchored legacy recurrence at {local.strftime('%a %H:%M %Z')}")
+    if changed:
+        save_schedules()
 
 
 def run_missed_fires_on_startup():
@@ -1361,6 +1403,7 @@ async def on_ready():
     if not hasattr(client, "_socket_task"):
         client._socket_task = asyncio.create_task(notify_listener())
     if not hasattr(client, "_scheduler_task"):
+        anchor_legacy_schedules()
         run_missed_fires_on_startup()
         client._scheduler_task = asyncio.create_task(scheduler_loop())
 

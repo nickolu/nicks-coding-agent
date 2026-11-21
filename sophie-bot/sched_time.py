@@ -114,6 +114,20 @@ def nominal_local(s: dict, tz: ZoneInfo) -> datetime:
     return to_local_naive(parse_iso_aware(s["fire_at_utc"], tz), tz)
 
 
+def ensure_anchor(s: dict, tz: ZoneInfo) -> bool:
+    """Give a recurring schedule a `nominal_local` anchor if it has none.
+
+    The anchor is derived from the current `fire_at_utc`, so call this *before*
+    anything (quiet-hours deferral) rewrites `fire_at_utc`, otherwise the
+    deferred time becomes the anchor and the schedule recurs at the wrong hour.
+    Returns True if the key was added. Non-recurring schedules are left alone.
+    """
+    if not s.get("recurrence") or s.get(NOMINAL_KEY):
+        return False
+    s[NOMINAL_KEY] = nominal_local(s, tz).replace(microsecond=0).isoformat(timespec="seconds")
+    return True
+
+
 # --- recurrence ---------------------------------------------------------------
 
 def _step(nominal: datetime, kind: str, n: int, tz: ZoneInfo) -> datetime:

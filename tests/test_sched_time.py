@@ -247,3 +247,40 @@ def test_bad_recurrence_raises():
 def test_local_naive_iso_roundtrip():
     assert st.local_naive_iso(utc(2026, 11, 5, 17, 0, 0), LA) == "2026-11-05T09:00:00"
     assert st.local_to_utc(datetime(2026, 11, 5, 9, 0), LA) == utc(2026, 11, 5, 17, 0)
+
+
+# --- ensure_anchor / legacy deferral --------------------------------------------------
+
+def test_ensure_anchor_sets_from_fire_at_only_when_missing():
+    s = sched(local(2026, 11, 10, 23), "daily", nominal=None)
+    assert st.ensure_anchor(s, LA) is True
+    assert s["nominal_local"] == "2026-11-10T23:00:00"
+    # Idempotent: an existing anchor is never overwritten.
+    s["fire_at_utc"] = local(2026, 11, 11, 8).isoformat()
+    assert st.ensure_anchor(s, LA) is False
+    assert s["nominal_local"] == "2026-11-10T23:00:00"
+
+
+def test_ensure_anchor_ignores_non_recurring():
+    s = sched(local(2026, 11, 10, 23), None, nominal=None)
+    assert st.ensure_anchor(s, LA) is False
+    assert "nominal_local" not in s
+
+
+def test_legacy_schedule_deferred_after_deploy_returns_to_its_hour():
+    # A pre-anchor 23:00 daily reminder hits quiet hours: the bot anchors it,
+    # then overwrites fire_at with 08:00 next day (what scheduler_tick does).
+    s = sched(local(2026, 11, 10, 23), "daily", nominal=None)
+    st.ensure_anchor(s, LA)
+    deferred = local(2026, 11, 11, 8)
+    s["fire_at_utc"] = deferred.isoformat()
+    st.advance_schedule(s, LA, now=deferred)
+    assert local_wall(s) == "2026-11-11 23:00 PST"
+
+
+def test_legacy_schedule_deferred_without_anchor_reproduces_old_bug():
+    # Documents the unrecoverable case: already deferred before deploy, no anchor.
+    deferred = local(2026, 11, 11, 8)
+    s = sched(deferred, "daily", nominal=None)
+    st.advance_schedule(s, LA, now=deferred)
+    assert local_wall(s) == "2026-11-12 08:00 PST"  # hence the startup warning in bot.py
