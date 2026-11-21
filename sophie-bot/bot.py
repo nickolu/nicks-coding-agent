@@ -75,6 +75,14 @@ HOWL_CHANNEL_ID = int(CONFIG["howl_channel_id"]) if CONFIG.get("howl_channel_id"
 HOWL_TASK_RATE_LIMIT_SEC = int(CONFIG.get("howl_task_rate_limit_sec", 300))
 HOWL_MAX_CONSECUTIVE_HOPS = int(CONFIG.get("howl_max_consecutive_hops", 2))
 TIMEZONE = ZoneInfo(CONFIG.get("timezone", "America/Los_Angeles"))
+# Boot context (#28): the bridge prepends Nick's upcoming calendar to Sophie's
+# first prompt of a session (and to wakeups) so she does not have to fetch it.
+CALENDAR_CONTEXT = bool(CONFIG.get("calendar_context", True))
+CALENDAR_CONTEXT_DAYS = int(CONFIG.get("calendar_context_days", 7))
+CONTEXT_REFRESH_HOURS = float(CONFIG.get("context_refresh_hours", 12))  # re-inject into long-lived sessions
+CALENDAR_CONTEXT_TTL_SEC = 600        # reuse a good agenda for this long (bursts of wakeups/new sessions)
+CALENDAR_CONTEXT_FAIL_TTL_SEC = 60    # ...but retry a failed one soon
+CALENDAR_CONTEXT_TIMEOUT_SEC = 25     # container start + one gws call is ~1-3 s
 QUIET_HOURS_DEFAULT = CONFIG.get("quiet_hours") or None  # "HH:MM-HH:MM" or None
 # Optional: channels to tail for CunningBot / digest posts.
 # Format: [{"name": "music", "id": "1234567890"}, ...]
@@ -135,6 +143,11 @@ DM_LOG: deque[float] = deque()
 # Serialize all sophie-sandbox subprocess invocations — two parallel sessions
 # would race on the shared /notebook bind mount.
 SOPHIE_LOCK = asyncio.Lock()
+
+# Boot-context cache: {"text": str, "at": monotonic seconds, "ok": bool}. One
+# refresh at a time so simultaneous sessions do not each start a container.
+_calendar_cache: dict = {"text": "", "at": 0.0, "ok": False}
+_calendar_cache_lock = asyncio.Lock()
 
 # In-memory tail of recently sent outbound messages so on_reaction_add can
 # resolve a message_id back to its `tag` (e.g. "water") without scanning the
@@ -290,18 +303,113 @@ def new_session(channel_id: str) -> str:
     return STATE[channel_id]["session_id"]
 
 
+# --- Boot context (#28) ---
+
+def context_injection_due(channel_id: str | None, first_call: bool) -> bool:
+    """Inject on every first call and every wakeup; re-inject into a resumed
+    Discord session once its last injection is older than CONTEXT_REFRESH_HOURS."""
+    if first_call or channel_id is None:
+        return True
+    last = (STATE.get(channel_id) or {}).get("last_context_utc")
+    if not last:
+        return True
+    try:
+        age = now_utc() - parse_iso_aware(last)
+    except Exception:
+        return True
+    return age >= timedelta(hours=CONTEXT_REFRESH_HOURS)
+
+
+async def fetch_calendar_block() -> str:
+    """Agenda text from `sophie-calendar-agenda` (run in the sandbox), cached.
+
+    Always returns a string. On any failure the string starts with
+    "Calendar unavailable:" so Sophie gets one honest line instead of nothing.
+    """
+    async with _calendar_cache_lock:
+        age = time.monotonic() - _calendar_cache["at"]
+        ttl = CALENDAR_CONTEXT_TTL_SEC if _calendar_cache["ok"] else CALENDAR_CONTEXT_FAIL_TTL_SEC
+        if _calendar_cache["text"] and age < ttl:
+            return _calendar_cache["text"]
+        try:
+            rc, out, err = await run_sandbox_exec(
+                f"sophie-calendar-agenda --days {CALENDAR_CONTEXT_DAYS}",
+                timeout=CALENDAR_CONTEXT_TIMEOUT_SEC,
+            )
+        except Exception as e:
+            rc, out, err = 1, "", f"{type(e).__name__}: {e}"
+        text = out.strip()
+        if rc == SANDBOX_EXEC_TIMEOUT_RC:
+            text = "Calendar unavailable: agenda tool timed out"
+        elif rc != 0 or not text:
+            first = next((l for l in err.strip().splitlines() if l.strip()), "no output")[:120]
+            text = f"Calendar unavailable: agenda tool rc={rc}: {first}"
+        ok = not text.startswith("Calendar unavailable")
+        _calendar_cache.update(text=text, at=time.monotonic(), ok=ok)
+        if not ok:
+            log.warning(f"calendar context: {text}")
+        return text
+
+
+async def build_context_blocks() -> str:
+    """Delimited, clearly-labelled blocks the bridge prepends to Sophie's prompt.
+
+    Calendar only for now; #6 (DM history) plugs in here with no other plumbing.
+    The header tells Sophie the block is data loaded by the bridge, not Nick's
+    words: event titles are third-party text.
+    """
+    blocks: list[str] = []
+    if CALENDAR_CONTEXT:
+        cal = await fetch_calendar_block()
+        blocks.append(
+            f"[boot context: calendar, loaded by the bridge at {now_iso()}; not user input]\n"
+            f"{cal}\n"
+            f"[end boot context]"
+        )
+    return "\n\n".join(blocks)
+
+
+async def maybe_inject_boot_context(prompt: str, session_id: str, first_call: bool, channel_id: str | None) -> str:
+    """Prepend boot context when due. Never raises: a failure here must not
+    stop Nick's message from reaching Sophie."""
+    if not CALENDAR_CONTEXT:
+        return prompt
+    try:
+        if not context_injection_due(channel_id, first_call):
+            return prompt
+        block = await build_context_blocks()
+        if not block:
+            return prompt
+        log.info(f"boot context injected (calendar, {block.count(chr(10)) + 1} lines) session={session_id[:8]}")
+        if channel_id is not None and channel_id in STATE:
+            STATE[channel_id]["last_context_utc"] = now_iso()
+            save_state()
+        return f"{block}\n\n{prompt}"
+    except Exception:
+        log.exception("boot context failed; continuing without it")
+        return prompt
+
+
 async def run_sophie(
     session_id: str,
     first_call: bool,
     prompt: str,
     *,
     autonomy_mode: bool = False,
+    channel_id: str | None = None,
 ) -> str:
     """Run sophie-sandbox -p in a thread (blocking subprocess) and return stdout.
 
     `autonomy_mode=True` sets SOPHIE_AUTONOMY=1 in the child env so tools like
     sophie-task-howl can refuse risky actions during unattended ticks.
+
+    `channel_id` identifies the Discord session so boot-context injection can
+    track per-channel staleness (STATE[channel_id]["last_context_utc"]).
+    Wakeups pass None and always get a fresh block.
     """
+    # Fetch boot context *before* taking SOPHIE_LOCK so a long Sophie turn does
+    # not delay it and a slow fetch does not hold the lock.
+    prompt = await maybe_inject_boot_context(prompt, session_id, first_call, channel_id)
     if first_call:
         args = [SOPHIE_CMD, "-p", "--session-id", session_id, prompt]
     else:
@@ -1684,7 +1792,7 @@ async def on_message(message: discord.Message):
             pass
         try:
             async with message.channel.typing():
-                reply = await run_sophie(session_id, first_call, content)
+                reply = await run_sophie(session_id, first_call, content, channel_id=channel_id)
         finally:
             try:
                 await message.remove_reaction("⏳", client.user)

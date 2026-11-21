@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Print Nick's primary-calendar agenda for the next N days, compactly, in local time.
+
+Runs inside the Sophie sandbox and shells out to `gws`. The bridge runs this at
+session start and prepends the output to Sophie's first prompt as a "boot
+context" block (issue #28). Sophie can also run it herself to refresh.
+
+Examples:
+  sophie-calendar-agenda                  # next 7 days, text
+  sophie-calendar-agenda --days 3
+  sophie-calendar-agenda --format json    # normalized events, machine-readable
+  sophie-calendar-agenda --tz America/New_York
+
+Output (text):
+  === Calendar: next 7 days (as of Sat Nov 21 09:14 PST) ===
+  Sat Nov 21 (today)
+    all-day      Finley's recital weekend
+    10:00-11:00  Dentist  @ Main St
+  Sun Nov 22 (tomorrow)
+    (nothing)
+
+Rules: cancelled events and events Nick declined are skipped; tentative or
+unanswered invites are marked "(invite)"; multi-day all-day events appear on
+each day they cover (Google's end.date is exclusive); timed events that cross
+midnight appear on their start day with the end day noted, and on later days
+as "until HH:MM"; summaries are truncated; descriptions are never printed
+(privacy, size, prompt-injection surface).
+
+Failure contract: ANY problem (gws not authenticated, timeout, API error, bad
+JSON) exits 0 and prints exactly one line
+
+  Calendar unavailable: <short reason>
+
+so the bridge can inject it verbatim and the session proceeds normally. Never
+prints tokens or raw stderr beyond a truncated first line.
+
+gws syntax (verified 2026-11-21 against gws 0.22.5; details in the Step 0
+comment on issue #30):
+
+  gws calendar events list --params '{"calendarId":"primary","timeMin":"<RFC3339>",
+      "timeMax":"<RFC3339>","singleEvents":true,"orderBy":"startTime","maxResults":100}' \
+      --page-all --page-limit 5
+
+  stdout  NDJSON with --page-all: one Google `Events` body per line (`items`;
+          `nextPageToken` on all but the last page). Pretty-printed single
+          object without --page-all. No preamble on stdout.
+  stderr  always "Using keyring backend: keyring"; errors as
+          "error[auth]: ..." / "error[api]: ...".
+  exit    0 ok; 1 API error with stdout {"error":{"code":..,"message":..}};
+          2 auth error (401 body); 3 validation; 4 discovery; 5 internal.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+GWS_TIMEOUT_SEC = 20
+PAGE_LIMIT = 5
+MAX_RESULTS = 100
+MAX_LINES = 60
+SUMMARY_MAX = 80
+LOCATION_MAX = 40
+DEFAULT_TZ = "America/Los_Angeles"
+
+
+class CalendarUnavailable(Exception):
+    """Raised for any failure; the message is the short reason shown to Sophie."""
+
+
+# --- gws ------------------------------------------------------------------------
+
+def run_gws(args: list[str], timeout: int = GWS_TIMEOUT_SEC) -> tuple[int, str, str]:
+    """Run gws and return (rc, stdout, stderr). Tests monkeypatch this name."""
+    r = subprocess.run(["gws", *args], capture_output=True, text=True, timeout=timeout)
+    return r.returncode, r.stdout, r.stderr
+
+
+def parse_gws_output(out: str) -> list[dict]:
+    """Parse gws stdout into a list of response bodies (one per page).
+
+    Accepts a single pretty-printed object or NDJSON (one object per line).
+    Non-JSON lines are ignored.
+    """
+    out = out.strip()
+    if not out:
+        return []
+    try:
+        obj = json.loads(out)
+        return [obj] if isinstance(obj, dict) else []
+    except ValueError:
+        pass
+    pages: list[dict] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            pages.append(obj)
+    return pages
+
+
+def _error_reason(rc: int, out: str, err: str) -> str:
+    """Short, token-free reason for a failed gws call."""
+    msg = ""
+    for page in parse_gws_output(out):
+        e = page.get("error")
+        if isinstance(e, dict):
+            msg = str(e.get("message") or "")
+            code = e.get("code")
+            if code in (401, 403) or rc == 2:
+                return "gws not authenticated (see #16)"
+            if code:
+                msg = f"{code} {msg}".strip()
+            break
+    if rc == 2:
+        return "gws not authenticated (see #16)"
+    if not msg:
+        first = next((l for l in err.strip().splitlines() if l.strip() and "keyring backend" not in l), "")
+        for prefix in ("error[auth]: ", "error[api]: ", "error: "):
+            if first.startswith(prefix):
+                first = first[len(prefix):]
+        msg = first or f"exit {rc}"
+    return f"gws error: {msg[:120]}"
+
+
+def fetch_events(time_min: datetime, time_max: datetime, calendar_id: str = "primary") -> list[dict]:
+    """Return raw Google event items between time_min and time_max (expanded instances)."""
+    params = {
+        "calendarId": calendar_id,
+        "timeMin": time_min.isoformat(),
+        "timeMax": time_max.isoformat(),
+        "singleEvents": True,
+        "orderBy": "startTime",
+        "maxResults": MAX_RESULTS,
+    }
+    args = ["calendar", "events", "list", "--params", json.dumps(params),
+            "--page-all", "--page-limit", str(PAGE_LIMIT)]
+    try:
+        rc, out, err = run_gws(args)
+    except subprocess.TimeoutExpired:
+        raise CalendarUnavailable("gws timed out")
+    except FileNotFoundError:
+        raise CalendarUnavailable("gws not installed")
+    if rc != 0:
+        raise CalendarUnavailable(_error_reason(rc, out, err))
+    pages = parse_gws_output(out)
+    if not pages:
+        raise CalendarUnavailable("gws returned unparsable output")
+    items: list[dict] = []
+    for page in pages:
+        if "error" in page:
+            raise CalendarUnavailable(_error_reason(1, json.dumps(page), err))
+        got = page.get("items")
+        if isinstance(got, list):
+            items.extend(e for e in got if isinstance(e, dict))
+    return items
+
+
+# --- normalization ----------------------------------------------------------------
+
+def parse_dt(s: str) -> datetime:
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _one_line(s: str | None, limit: int) -> str:
+    s = " ".join((s or "").split())
+    return s if len(s) <= limit else s[: limit - 1].rstrip() + "…"
+
+
+def normalize(ev: dict, tz: ZoneInfo) -> dict | None:
+    """Google event -> compact dict, or None if it should not be shown."""
+    if ev.get("status") == "cancelled":
+        return None
+    self_att = next((a for a in ev.get("attendees") or [] if isinstance(a, dict) and a.get("self")), None)
+    resp = self_att.get("responseStatus") if self_att else None
+    if resp == "declined":
+        return None
+    start = ev.get("start") or {}
+    end = ev.get("end") or {}
+    try:
+        if start.get("date") and not start.get("dateTime"):
+            s_val = date.fromisoformat(start["date"])
+            e_val = date.fromisoformat(end["date"]) if end.get("date") else s_val + timedelta(days=1)
+            all_day = True
+        elif start.get("dateTime"):
+            s_val = parse_dt(start["dateTime"]).astimezone(tz)
+            e_val = parse_dt(end["dateTime"]).astimezone(tz) if end.get("dateTime") else s_val
+            all_day = False
+        else:
+            return None
+    except (ValueError, TypeError):
+        return None
+    return {
+        "id": ev.get("id") or "",
+        "summary": _one_line(ev.get("summary"), SUMMARY_MAX) or "(no title)",
+        "start": s_val,
+        "end": e_val,
+        "all_day": all_day,
+        "location": _one_line(ev.get("location"), 200),
+        "invite": resp in ("tentative", "needsAction"),
+        "response_status": resp,
+        "status": ev.get("status"),
+        "html_link": ev.get("htmlLink"),
+    }
+
+
+def covers(n: dict, day: date) -> bool:
+    """Does this normalized event occupy any part of local calendar day `day`?"""
+    if n["all_day"]:
+        end = n["end"] if n["end"] > n["start"] else n["start"] + timedelta(days=1)
+        return n["start"] <= day < end
+    s, e = n["start"], n["end"]
+    if e <= s:
+        return s.date() == day
+    last_day = (e - timedelta(microseconds=1)).date()  # end is exclusive
+    return s.date() <= day <= last_day
+
+
+# --- rendering ------------------------------------------------------------------------
+
+def _time_str(n: dict, day: date) -> str:
+    if n["all_day"]:
+        return "all-day"
+    s, e = n["start"], n["end"]
+    if s.date() == day:
+        if e <= s:
+            return s.strftime("%H:%M")
+        if e.date() == day or (e.date() == day + timedelta(days=1) and e.time() == time(0)):
+            return f"{s:%H:%M}-{e:%H:%M}"
+        return f"{s:%H:%M}-{e:%H:%M} ({e:%a})"
+    return f"until {e:%H:%M}"
+
+
+def _sort_key(n: dict, day: date):
+    if n["all_day"]:
+        return (0, time(0), n["summary"].lower())
+    t = n["start"].time() if n["start"].date() == day else time(0)
+    return (1, t, n["summary"].lower())
+
+
+def render_agenda(events: list[dict], now: datetime, tz: ZoneInfo, days: int) -> str:
+    """Pure: raw Google items -> compact text agenda for `days` local days starting today."""
+    now_local = now.astimezone(tz)
+    today = now_local.date()
+    seen: set[str] = set()
+    norm: list[dict] = []
+    for ev in events:
+        n = normalize(ev, tz)
+        if n is None:
+            continue
+        key = n["id"] or f"{n['summary']}|{n['start']}"
+        if key in seen:
+            continue
+        seen.add(key)
+        norm.append(n)
+
+    header = f"=== Calendar: next {days} days (as of {now_local.strftime('%a %b %d %H:%M %Z')}) ==="
+    lines: list[str] = []
+    any_event = False
+    for i in range(days):
+        day = today + timedelta(days=i)
+        suffix = " (today)" if i == 0 else " (tomorrow)" if i == 1 else ""
+        lines.append(f"{day.strftime('%a %b %d')}{suffix}")
+        todays = sorted((n for n in norm if covers(n, day)), key=lambda n: _sort_key(n, day))
+        if not todays:
+            lines.append("  (nothing)")
+            continue
+        any_event = True
+        for n in todays:
+            line = f"  {_time_str(n, day):<12} {n['summary']}"
+            if n["location"] and len(n["location"]) <= LOCATION_MAX:
+                line += f"  @ {n['location']}"
+            if n["invite"]:
+                line += "  (invite)"
+            lines.append(line)
+
+    if not any_event:
+        return f"{header}\n(no events)"
+    if len(lines) > MAX_LINES:
+        extra = len(lines) - MAX_LINES
+        lines = lines[:MAX_LINES] + [f"  ... {extra} more"]
+    return "\n".join([header, *lines])
+
+
+def to_json(events: list[dict], tz: ZoneInfo) -> list[dict]:
+    out = []
+    for ev in events:
+        n = normalize(ev, tz)
+        if n is None:
+            continue
+        n = dict(n)
+        n["start"] = n["start"].isoformat()
+        n["end"] = n["end"].isoformat()
+        out.append(n)
+    return out
+
+
+# --- main -------------------------------------------------------------------------------
+
+def resolve_tz(name: str | None) -> ZoneInfo:
+    for candidate in (name, os.environ.get("TZ"), DEFAULT_TZ):
+        if not candidate:
+            continue
+        try:
+            return ZoneInfo(candidate)
+        except Exception:
+            continue
+    return ZoneInfo("UTC")
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--days", type=int, default=7, help="How many local days to show, starting today (default 7)")
+    p.add_argument("--tz", default=None, help="IANA timezone (default: $TZ, else America/Los_Angeles)")
+    p.add_argument("--format", choices=("text", "json"), default="text")
+    p.add_argument("--calendar", default="primary", help="Calendar id (default primary)")
+    p.add_argument("--now", default=None, help=argparse.SUPPRESS)  # test hook: ISO timestamp
+    args = p.parse_args(argv)
+
+    tz = resolve_tz(args.tz)
+    days = max(1, min(args.days, 60))
+    now = parse_dt(args.now) if args.now else datetime.now(tz=timezone.utc)
+    today = now.astimezone(tz).date()
+    time_min = datetime.combine(today, time(0), tzinfo=tz)
+    time_max = datetime.combine(today + timedelta(days=days), time(0), tzinfo=tz)
+
+    try:
+        events = fetch_events(time_min, time_max, args.calendar)
+    except CalendarUnavailable as e:
+        print(f"Calendar unavailable: {e}")
+        return 0
+    except Exception as e:  # never let the bridge see a traceback
+        print(f"Calendar unavailable: {type(e).__name__}")
+        return 0
+
+    if args.format == "json":
+        print(json.dumps(to_json(events, tz), ensure_ascii=False))
+    else:
+        print(render_agenda(events, now, tz, days))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
