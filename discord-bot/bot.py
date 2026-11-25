@@ -248,7 +248,7 @@ async def watcher_loop(watcher_id: str, info: dict):
                 break
             await asyncio.sleep(min(every, remaining))
 
-        await send_dm(f"\u23f0 **Watcher expired** (`{watcher_id[:8]}`)\nTimed out watching: {description}")
+        await post_to_channel(channel_id, f"\u23f0 **Watcher expired** (`{watcher_id[:8]}`)\nTimed out watching: {description}")
         log.info(f"watcher {watcher_id[:8]} timed out")
     except asyncio.CancelledError:
         log.info(f"watcher {watcher_id[:8]} cancelled")
@@ -289,7 +289,8 @@ def start_watcher(payload: dict) -> str:
     WATCHERS[watcher_id] = {"task": task, "info": info}
 
     fires_action = "wakes Howl to continue" if channel_id else "DMs you"
-    asyncio.create_task(send_dm(
+    asyncio.create_task(post_to_channel(
+        channel_id,
         f"\U0001f440 **Watcher started** (`{watcher_id[:8]}`)\n"
         f"{description}\n"
         f"Checking every {every}s, expires in {timeout_min}min. On match: {fires_action}."
@@ -415,9 +416,16 @@ async def auto_loop(project: str, info: dict):
     duration_min = info["duration_min"]
     interval_min = info["interval_min"]
     last_announced_instructions = info["instructions"]
+    # Channel the loop was started from. Every status post and the Claude
+    # session itself are bound to it so output lands there, not in Nick's DMs
+    # (post_to_channel falls back to a DM if the channel can't be resolved).
+    channel_id = info.get("channel_id", "")
+
+    async def say(msg: str):
+        await post_to_channel(channel_id, msg)
 
     log.info(f"auto-loop started: project={project} repo={repo} duration={duration_min}m interval={interval_min}m")
-    await send_dm(
+    await say(
         f"\U0001f916 **Auto mode started** for `{project}`\n"
         f"Duration: {duration_min}min | Idle interval: {interval_min}min\n"
         f"Instructions: {info['instructions'] or '(none)'}\n"
@@ -433,11 +441,11 @@ async def auto_loop(project: str, info: dict):
             remaining = int((deadline - time.time()) / 60)
             log.info(f"auto-loop {project} cycle {cycle} ({remaining}min remaining)")
 
-            cycle_dm = f"\U0001f680 **Auto cycle #{cycle} starting** — `{project}` ({remaining}min left)"
+            cycle_msg = f"\U0001f680 **Auto cycle #{cycle} starting** — `{project}` ({remaining}min left)"
             if instructions != last_announced_instructions:
-                cycle_dm += f"\n\U0001f4dd New instructions in effect: {instructions or '(none)'}"
+                cycle_msg += f"\n\U0001f4dd New instructions in effect: {instructions or '(none)'}"
                 last_announced_instructions = instructions
-            await send_dm(cycle_dm)
+            await say(cycle_msg)
 
             status = "IDLE"
             stop_reason = ""
@@ -446,13 +454,13 @@ async def auto_loop(project: str, info: dict):
                 state = await gather_project_state(project, repo)
                 prompt = build_auto_prompt(project, repo, instructions, state, cycle)
                 first_call = (cycle == 1)
-                reply = await run_claude(session_id, first_call, prompt)
+                reply = await run_claude(session_id, first_call, prompt, channel_id=channel_id)
                 status, stop_reason = parse_cycle_status(reply)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 log.exception(f"auto-loop {project} cycle {cycle} failed")
-                await send_dm(
+                await say(
                     f"⚠️ **Auto cycle #{cycle} errored** — `{project}`: {e}\n"
                     f"Backing off {interval_min}min."
                 )
@@ -465,7 +473,7 @@ async def auto_loop(project: str, info: dict):
                     mode_label = "self-stopping"
                 else:
                     mode_label = f"idle — sleeping {interval_min}min"
-                await send_dm(
+                await say(
                     f"\U0001f504 **Auto cycle #{cycle}** — `{project}` "
                     f"({remaining}min left, {mode_label})\n{summary}"
                 )
@@ -474,7 +482,7 @@ async def auto_loop(project: str, info: dict):
 
             if status == "STOP":
                 tail = f" — {stop_reason}" if stop_reason else "."
-                await send_dm(
+                await say(
                     f"\U0001f6d1 **Auto mode self-stopped** for `{project}` after {cycle} cycles{tail}"
                 )
                 log.info(f"auto-loop {project} self-stopped after {cycle} cycles: {stop_reason}")
@@ -488,11 +496,11 @@ async def auto_loop(project: str, info: dict):
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
 
-        await send_dm(f"\U0001f3c1 **Auto mode finished** for `{project}` after {info['cycle']} cycles.")
+        await say(f"\U0001f3c1 **Auto mode finished** for `{project}` after {info['cycle']} cycles.")
         log.info(f"auto-loop {project} finished after {info['cycle']} cycles")
 
     except asyncio.CancelledError:
-        await send_dm(f"\u26d4 **Auto mode stopped** for `{project}` after {info['cycle']} cycles.")
+        await say(f"\u26d4 **Auto mode stopped** for `{project}` after {info['cycle']} cycles.")
         log.info(f"auto-loop {project} cancelled after {info['cycle']} cycles")
     finally:
         AUTO_LOOPS.pop(project, None)
@@ -867,6 +875,7 @@ async def on_message(message: discord.Message):
             "instructions": instructions,
             "deadline": time.time() + duration_min * 60,
             "cycle": 0,
+            "channel_id": channel_id,
         }
         task = asyncio.create_task(auto_loop(project, info))
         AUTO_LOOPS[project] = {"task": task, "info": info}

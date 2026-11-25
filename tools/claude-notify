@@ -7,15 +7,22 @@ Usage:
   claude-notify --channel 1500961760117522563 "message"
 
 Flags:
-  --channel <id>   Post to a Discord channel by ID instead of DMing Nick.
+  --channel <id>   Post to a Discord channel by ID.
                    Example: claude-notify --channel 1500961760117522563 "done"
+  --dm             Force a DM to Nick even when CLAUDE_CHANNEL_ID is set.
+
+Destination defaults to the channel Howl was invoked from (the bot exports it as
+CLAUDE_CHANNEL_ID into the container). With no channel known, it DMs Nick.
 """
 import argparse
 import json
+import os
 import socket
 import sys
 
 SOCKET = "/run/claude-discord.sock"
+# Set by the bot when it launches Claude for a channel (DM or guild channel).
+DEFAULT_CHANNEL_ID = os.environ.get("CLAUDE_CHANNEL_ID", "")
 
 
 def send(payload_or_text) -> None:
@@ -37,9 +44,14 @@ def main() -> int:
     )
     p.add_argument(
         "--channel",
-        default="",
+        default=DEFAULT_CHANNEL_ID,
         metavar="CHANNEL_ID",
-        help="Discord channel ID to post to (default: DM to Nick).",
+        help="Discord channel ID to post to (default: $CLAUDE_CHANNEL_ID, else DM to Nick).",
+    )
+    p.add_argument(
+        "--dm",
+        action="store_true",
+        help="Send as a DM to Nick, ignoring CLAUDE_CHANNEL_ID.",
     )
     p.add_argument("message", nargs="*", help="Message text. Falls back to stdin if omitted.")
     args = p.parse_args()
@@ -48,9 +60,10 @@ def main() -> int:
     if not msg:
         return 0
 
+    channel = "" if args.dm else args.channel
     try:
-        if args.channel:
-            send({"type": "notify", "message": msg, "channel_id": args.channel})
+        if channel:
+            send({"type": "notify", "message": msg, "channel_id": channel})
         else:
             send(msg)
     except FileNotFoundError:
