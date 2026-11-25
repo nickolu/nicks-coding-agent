@@ -7,6 +7,9 @@
   "howl_max_consecutive_hops": 2,
   "timezone": "America/Los_Angeles",
   "quiet_hours": "22:00-08:00",
+  "calendar_context": true,
+  "calendar_context_days": 7,
+  "context_refresh_hours": 12,
   "attachments_dir": "/home/sophie/notebook/attachments",
   "digest_channels": [
     {"name": "music", "id": "REPLACE_WITH_MUSIC_CHANNEL_ID"},
